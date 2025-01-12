@@ -2467,3 +2467,11 @@ Two Bay Area cousins have been sentenced to a combined 985 years in state prison
 2025-01-11 12:53:27,371 - DEBUG - request_id: req_674b42308b56846b7646fed50e9017ed
 2025-01-11 13:07:58,546 - DEBUG - close.started
 2025-01-11 13:07:58,547 - DEBUG - close.complete
+2025-01-12 18:45:12,121 - WARNING - From C:\Users\Benja\AppData\Local\Programs\Python\Python310\lib\site-packages\keras\src\backend\common\global_state.py:82: The name tf.reset_default_graph is deprecated. Please use tf.compat.v1.reset_default_graph instead.
+
+2025-01-12 18:45:24,897 - DEBUG - Starting new HTTPS connection (1): newsapi.org:443
+2025-01-12 18:45:25,242 - DEBUG - https://newsapi.org:443 "GET /v2/everything?q=Tesla&apiKey=094c290eb67947f49e810df71d90cad7&language=en&sortBy=publishedAt&pageSize=10 HTTP/1.1" 200 None
+2025-01-12 18:46:08,693 - DEBUG - Starting new HTTPS connection (1): newsapi.org:443
+2025-01-12 18:46:08,967 - DEBUG - https://newsapi.org:443 "GET /v2/everything?q=TSLA&apiKey=094c290eb67947f49e810df71d90cad7&language=en&sortBy=publishedAt&pageSize=10 HTTP/1.1" 200 None
+2025-01-12 18:46:31,334 - INFO - Firebase initialized successfully.
+2025-01-12 18:46:31,455 - INFO - Queried 60 documents from Firestore collection: news

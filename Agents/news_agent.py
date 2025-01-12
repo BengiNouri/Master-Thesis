@@ -18,14 +18,30 @@ from Agents.sentiment_agent import analyze_sentiment_and_store
 load_dotenv()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-# Firebase Initialization Function
+import os
+import firebase_admin
+from firebase_admin import credentials, firestore
+
 def initialize_firebase():
     """
-    Initialize Firebase if not already initialized.
+    Initialize Firebase with a fallback if the primary path fails.
     """
+    primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
+    fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
+
+    # Check if Firebase is already initialized
     if not firebase_admin._apps:
-        cred = credentials.Certificate(r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json")
-        initialize_app(cred)
+        # Try the primary path first
+        if os.path.exists(primary_path):
+            cred = credentials.Certificate(primary_path)
+        # If not, use the fallback path
+        elif os.path.exists(fallback_path):
+            cred = credentials.Certificate(fallback_path)
+        else:
+            raise FileNotFoundError("Firebase credentials file not found in both paths.")
+        
+        firebase_admin.initialize_app(cred)
+
     return firestore.client()
 
 # Initialize Firebase
