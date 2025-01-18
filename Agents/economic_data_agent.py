@@ -10,23 +10,31 @@ def initialize_firebase():
     """
     Initialize Firebase with a fallback if the primary path fails.
     """
+    # Path for the virtual machine
+    vm_path = r"C:\MasterThesis\Keys.json"
+    
+    # Local machine paths
     primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
     fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
 
     # Check if Firebase is already initialized
     if not firebase_admin._apps:
-        # Try the primary path first
-        if os.path.exists(primary_path):
+        # Try the VM path first
+        if os.path.exists(vm_path):
+            cred = credentials.Certificate(vm_path)
+        # Try the primary local path
+        elif os.path.exists(primary_path):
             cred = credentials.Certificate(primary_path)
-        # If not, use the fallback path
+        # Fallback local path
         elif os.path.exists(fallback_path):
             cred = credentials.Certificate(fallback_path)
         else:
-            raise FileNotFoundError("Firebase credentials file not found in both paths.")
+            raise FileNotFoundError("Firebase credentials file not found in any path.")
         
         firebase_admin.initialize_app(cred)
 
     return firestore.client()
+
 
 # Initialize Firebase
 db = initialize_firebase()
