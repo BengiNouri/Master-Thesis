@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import firestore, initialize_app, credentials
 from dotenv import load_dotenv
+import re
 
 # TensorFlow workaround
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -20,35 +21,26 @@ from Agents.sentiment_agent import analyze_sentiment_and_store
 load_dotenv()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
+# 🔐 Initialize Firebase
 def initialize_firebase():
     """
     Initialize Firebase with a fallback if the primary path fails.
     """
-    # Path for the virtual machine
     vm_path = r"C:\MasterThesis\Keys.json"
-    
-    # Local machine paths
     primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
     fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
 
-    # Check if Firebase is already initialized
     if not firebase_admin._apps:
-        # Try the VM path first
         if os.path.exists(vm_path):
             cred = credentials.Certificate(vm_path)
-        # Try the primary local path
         elif os.path.exists(primary_path):
             cred = credentials.Certificate(primary_path)
-        # Fallback local path
         elif os.path.exists(fallback_path):
             cred = credentials.Certificate(fallback_path)
         else:
             raise FileNotFoundError("Firebase credentials file not found in any path.")
-        
         firebase_admin.initialize_app(cred)
-
     return firestore.client()
-
 
 # Initialize Firebase
 db = initialize_firebase()
@@ -109,41 +101,43 @@ def store_in_firebase(collection_name, data):
     except Exception as e:
         print(f"❌ Error storing data: {e}")
 
+# 🔗 Link News to Economic Data
 def link_news_to_economic_data(news_id, keyword):
-    """
-    Link news articles to economic data based on the keyword.
-    """
     try:
         stock_ticker = STOCK_MAPPING.get(keyword.lower())
-
         if not stock_ticker:
             print(f"⚠️ No stock ticker found for '{keyword}'.")
             return
 
-        # Link the news article to the economic data
-        db.collection("news").document(news_id).update({
-            "economic_data_id": stock_ticker
-        })
-
-        # Link back in economic data
+        db.collection("news").document(news_id).update({"economic_data_id": stock_ticker})
         db.collection("latest_economic_data").document(stock_ticker).update({
             "linked_news_ids": firestore.ArrayUnion([news_id])
         })
-
         print(f"🔗 Linked news ID {news_id} to economic data ID {stock_ticker}")
-
     except Exception as e:
         print(f"❌ Error linking news: {e}")
 
+# 🔍 Extract Core Recommendation
+def extract_recommendation(recommendation):
+    match = re.search(r"\b(buy|hold|sell)\b", recommendation, re.IGNORECASE)
+    return match.group(1).lower() if match else None
 
-# 📊 Evaluate Recommendations
+# 📊 Evaluate Recommendation
 def evaluate_recommendation(stock_ticker, recommendation):
     latest_close, previous_close = fetch_closing_prices(stock_ticker)
     if not latest_close or not previous_close:
         return False, latest_close, previous_close
+
+    core_recommendation = extract_recommendation(recommendation)
+    if not core_recommendation:
+        print(f"⚠️ No clear recommendation extracted for {stock_ticker}")
+        return False, latest_close, previous_close
+
     price_movement = "up" if latest_close > previous_close else "down"
-    is_correct = ((recommendation.lower() in ["buy", "hold"] and price_movement == "up") or
-                  (recommendation.lower() == "sell" and price_movement == "down"))
+    is_correct = ((core_recommendation in ["buy", "hold"] and price_movement == "up") or
+                  (core_recommendation == "sell" and price_movement == "down"))
+
+    print(f"📊 {stock_ticker} | Recommendation: {core_recommendation} | Movement: {price_movement} | Correct: {is_correct}")
     return is_correct, latest_close, previous_close
 
 # 📝 Store Recommendation Results
@@ -176,19 +170,20 @@ def process_articles(keywords, page_size=10):
          "keywords": keywords, "sentiment_id": None, "economic_data_id": None}
         for article in articles
     ]
+
     store_in_firebase("news", structured_articles)
     print("🧠 Triggering sentiment analysis...")
     analyze_sentiment_and_store()
-    
-    print("🔗 Linking news articles...")
+
     for article in structured_articles:
         for keyword in keywords:
             link_news_to_economic_data(article["doc_id"], keyword)
 
     for keyword in keywords:
-        recommendation = "buy"  # Placeholder
-        is_correct, latest_close, previous_close = evaluate_recommendation(STOCK_MAPPING[keyword.lower()], recommendation)
-        store_recommendation(STOCK_MAPPING[keyword.lower()], recommendation, is_correct, latest_close, previous_close)
+        stock_ticker = STOCK_MAPPING[keyword.lower()]
+        recommendation = "Buy"  # Placeholder
+        is_correct, latest_close, previous_close = evaluate_recommendation(stock_ticker, recommendation)
+        store_recommendation(stock_ticker, recommendation, is_correct, latest_close, previous_close)
 
     print("✅ Workflow completed successfully!")
 
