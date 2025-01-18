@@ -62,32 +62,31 @@ def summarize_text(text, max_length=50, min_length=20):
 
 def summarize_documents_from_firestore():
     """
-    Hent dokumenter fra Firestore, generér opsummeringer og gem dem tilbage.
+    Generate and store summaries for news articles in the Firestore 'news' collection.
     """
     try:
-        # Hent nyhedsartikler fra Firestore
         news_ref = db.collection("news")
         articles = news_ref.stream()
 
         for article in articles:
             doc = article.to_dict()
             doc_id = article.id
-
-            # Opsummering
             content = doc.get("content", "")
+
             if not content:
-                print(f"No content for document ID: {doc_id}")
+                print(f"⚠️ No content for news ID: {doc_id}")
                 continue
 
+            # Generate summary
             summary = summarize_text(content)
-            print(f"Document ID: {doc_id} | Summary: {summary}")
 
-            # Gem opsummering tilbage i Firestore
+            # Update the news document with the summary
             news_ref.document(doc_id).update({"summary": summary})
-            print(f"Summary saved for document ID: {doc_id}")
+            print(f"✅ Summary stored for news ID: {doc_id}")
 
     except Exception as e:
-        print(f"Error summarizing documents: {e}")
+        print(f"❌ Error summarizing documents: {e}")
+
 
 if __name__ == "__main__":
     summarize_documents_from_firestore()

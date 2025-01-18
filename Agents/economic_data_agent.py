@@ -83,5 +83,5 @@ def economic_data_agent(stock_tickers):
             store_latest_data(ticker, data)
 
 if __name__ == "__main__":
-    stock_tickers = ["TSLA", "NVO", "NVDA", "AAPL", "MSFT"]
+    stock_tickers = ["TSLA", "NVO", "NVDA", "AAPL", "MSFT", "NOVO-B.CO"]
     economic_data_agent(stock_tickers)
