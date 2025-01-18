@@ -58,7 +58,7 @@ def fetch_unprocessed_news():
 
 def analyze_sentiment_and_store():
     """
-    Analyze sentiment of unprocessed news articles using FinBERT and store results in Firestore.
+    Analyze sentiment of unprocessed news articles using FinBERT and store results directly in the news collection.
     """
     try:
         news_docs = fetch_unprocessed_news()
@@ -73,31 +73,27 @@ def analyze_sentiment_and_store():
             content = news_data.get("content", "")
 
             if not content:
-                print(f"⚠️ No content available for news article with ID: {news_id}")
+                print(f"⚠️ No content for news ID: {news_id}")
                 continue
 
             # Perform sentiment analysis with FinBERT
-            sentiment_results = sentiment_analyzer(content[:512])  # Limit content length for processing
-            sentiment_label = sentiment_results[0]["label"].lower()  # "positive", "neutral", "negative"
+            sentiment_results = sentiment_analyzer(content[:512])
+            sentiment_label = sentiment_results[0]["label"].lower()
             sentiment_score = sentiment_results[0]["score"]
 
-            # Store sentiment result in Firestore and link back to news with news_id
-            sentiment_data = {
-                "label": sentiment_label,
-                "score": sentiment_score,
-                "news_id": news_id  # Linking sentiment back to the news article
-            }
-            sentiment_ref = db.collection("sentiment").document()
-            sentiment_ref.set(sentiment_data)
-            sentiment_id = sentiment_ref.id
+            # Update sentiment directly in the news document
+            db.collection("news").document(news_id).update({
+                "sentiment": {
+                    "label": sentiment_label,
+                    "score": sentiment_score
+                }
+            })
 
-            # Update the news document with the sentiment_id
-            db.collection("news").document(news_id).update({"sentiment_id": sentiment_id})
-
-            print(f"✅ Processed sentiment for news ID: {news_id} | Sentiment: {sentiment_label} (Score: {sentiment_score})")
+            print(f"✅ Sentiment stored for news ID: {news_id} | {sentiment_label} ({sentiment_score})")
 
     except Exception as e:
         print(f"❌ Error in sentiment analysis: {e}")
+
 
 if __name__ == "__main__":
     analyze_sentiment_and_store()
