@@ -8,25 +8,43 @@ from firebase_admin import firestore, credentials
 from Agents.news_agent import process_articles
 from Agents.rag_agent import generate_rag_response
 from Agents.sentiment_agent import analyze_sentiment_and_store
-from fuzzywuzzy import process
+import warnings
+import tensorflow as tf
+import torch
 
 # ✅ Load environment variables
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+# ✅ Suppress Warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
+warnings.filterwarnings("ignore", category=UserWarning)
+torch._C._jit_set_profiling_executor(False)
+torch._C._jit_set_profiling_mode(False)
+
+# ✅ Define experiment start date
+EXPERIMENT_START_DATE = datetime(2025, 1, 18)
+
 # 🔐 Initialize Firebase
 def initialize_firebase():
+    vm_path = r"C:\MasterThesis\Keys.json"
     primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
     fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
 
     if not firebase_admin._apps:
-        cred_path = primary_path if os.path.exists(primary_path) else fallback_path
-        cred = credentials.Certificate(cred_path)
+        if os.path.exists(vm_path):
+            cred = credentials.Certificate(vm_path)
+        elif os.path.exists(primary_path):
+            cred = credentials.Certificate(primary_path)
+        elif os.path.exists(fallback_path):
+            cred = credentials.Certificate(fallback_path)
+        else:
+            raise FileNotFoundError("Firebase credentials file not found.")
         firebase_admin.initialize_app(cred)
-
     return firestore.client()
 
-# Initialize Firebase
+# ✅ Initialize Firebase
 db = initialize_firebase()
 
 # 📈 Fetch Stock Prices
@@ -55,17 +73,30 @@ def evaluate_recommendation(stock_ticker, recommendation):
 # 📝 Store Recommendation Results
 def store_recommendation(stock_ticker, recommendation, is_correct, latest_close, previous_close):
     try:
+        experiment_day = (datetime.now() - EXPERIMENT_START_DATE).days
+        experiment_day = min(experiment_day, 90)  # Cap at 90 days
+
         db.collection("model_recommendations").add({
             "stock_ticker": stock_ticker,
             "recommendation": recommendation,
             "is_correct": is_correct,
             "latest_close": latest_close,
             "previous_close": previous_close,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "experiment_day": experiment_day  # ✅ New Field
         })
-        print(f"✅ Stored recommendation for {stock_ticker}: {recommendation} | Correct: {is_correct}")
+        print(f"✅ Stored recommendation for {stock_ticker}: {recommendation} | Correct: {is_correct} | Day: {experiment_day}")
     except Exception as e:
         print(f"❌ Error storing recommendation: {e}")
+
+# ✅ Check if Article Was Processed
+def is_article_processed(article_id):
+    try:
+        doc_ref = db.collection("news").document(article_id)
+        return doc_ref.get().exists
+    except Exception as e:
+        print(f"❌ Error checking if article {article_id} is processed: {e}")
+        return False
 
 # 🔄 Run Daily Pipeline
 def run_daily_pipeline(stock_tickers, articles_per_stock=20):
@@ -73,25 +104,62 @@ def run_daily_pipeline(stock_tickers, articles_per_stock=20):
         print(f"\n🔍 Processing {stock}...")
 
         # Step 1: Fetch News Articles
-        process_articles([stock], articles_per_stock)
+        try:
+            process_articles([stock], articles_per_stock)
+            print(f"🔎 Fetched up to {articles_per_stock} articles for {stock}")
+        except Exception as e:
+            print(f"❌ Error processing articles for {stock}: {e}")
+            continue
 
         # Step 2: Run Sentiment Analysis
-        analyze_sentiment_and_store()
+        try:
+            analyze_sentiment_and_store()
+            print(f"🧠 Sentiment analysis completed for {stock}")
+        except Exception as e:
+            print(f"❌ Error running sentiment analysis for {stock}: {e}")
+            continue
 
         # Step 3: Fetch Related News
-        related_news = db.collection("news").where("economic_data_id", "==", stock).stream()
-        news_docs = [doc.to_dict() for doc in related_news]
+        try:
+            related_news = db.collection("news").where("economic_data_id", "==", stock).stream()
+            news_docs = [doc.to_dict() for doc in related_news if not is_article_processed(doc.id)]
+
+            if not news_docs:
+                print(f"📰 No new articles available for {stock}. Skipping recommendation.")
+                continue
+
+            print(f"📰 {len(news_docs)} new articles analyzed for {stock}")
+        except Exception as e:
+            print(f"❌ Error fetching related news for {stock}: {e}")
+            continue
 
         # Step 4: Generate Recommendation
-        recommendation = generate_rag_response(f"What's the outlook for {stock}?", news_docs)
+        try:
+            recommendation = generate_rag_response(f"What's the outlook for {stock}?", news_docs)
+
+            if "⚠️ No relevant data found" in recommendation:
+                print(f"📊 Recommendation for {stock}: {recommendation}. Skipping storage.")
+                continue
+
+            print(f"📊 Recommendation for {stock}: {recommendation}")
+        except Exception as e:
+            print(f"❌ Error generating recommendation for {stock}: {e}")
+            continue
 
         # Step 5: Evaluate Recommendation
-        is_correct, latest_close, previous_close = evaluate_recommendation(stock, recommendation)
+        try:
+            is_correct, latest_close, previous_close = evaluate_recommendation(stock, recommendation)
+        except Exception as e:
+            print(f"❌ Error evaluating recommendation for {stock}: {e}")
+            continue
 
-        # Step 6: Store Recommendation Result
-        store_recommendation(stock, recommendation, is_correct, latest_close, previous_close)
+        # Step 6: Store Recommendation
+        try:
+            store_recommendation(stock, recommendation, is_correct, latest_close, previous_close)
+        except Exception as e:
+            print(f"❌ Error storing recommendation for {stock}: {e}")
 
 # 🚀 Main Execution
 if __name__ == "__main__":
-    stock_tickers = ["TSLA", "AAPL", "MSFT", "NVDA", "NVO"]  # Stocks to analyze
+    stock_tickers = ["TSLA", "AAPL", "MSFT", "NVDA", "NVO"]
     run_daily_pipeline(stock_tickers)

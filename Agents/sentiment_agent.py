@@ -1,41 +1,21 @@
 import os
-from firebase_admin import firestore, initialize_app, credentials
-from dotenv import load_dotenv
-from transformers import pipeline
-
-# Suppress TensorFlow warnings
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
-# Load environment variables
-load_dotenv()
-
 import firebase_admin
 from firebase_admin import firestore, credentials
+from transformers import pipeline
+from datetime import datetime
 
-import os
-import firebase_admin
-from firebase_admin import credentials, firestore
-
+# Initialize Firebase
 def initialize_firebase():
-    """
-    Initialize Firebase with a fallback if the primary path fails.
-    """
-    # Path for the virtual machine
     vm_path = r"C:\MasterThesis\Keys.json"
-    
-    # Local machine paths
     primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
     fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
 
-    # Check if Firebase is already initialized
     if not firebase_admin._apps:
-        # Try the VM path first
+        cred = None
         if os.path.exists(vm_path):
             cred = credentials.Certificate(vm_path)
-        # Try the primary local path
         elif os.path.exists(primary_path):
             cred = credentials.Certificate(primary_path)
-        # Fallback local path
         elif os.path.exists(fallback_path):
             cred = credentials.Certificate(fallback_path)
         else:
@@ -45,63 +25,60 @@ def initialize_firebase():
 
     return firestore.client()
 
-
-# Initialize Firebase
+# Initialize Firebase client
 db = initialize_firebase()
 
-# Initialize Sentiment Analysis Model with FinBERT
+# Initialize FinBERT Sentiment Analyzer
 sentiment_analyzer = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-
-def fetch_unprocessed_news():
-    """
-    Fetch news articles from Firestore that do not have sentiment analysis.
-    """
-    try:
-        news_ref = db.collection("news")
-        query = news_ref.where("sentiment_id", "==", None)  # Fetch articles without sentiment analysis
-        return [doc for doc in query.stream()]
-    except Exception as e:
-        print(f"❌ Error fetching unprocessed news: {e}")
-        return []
 
 def analyze_sentiment_and_store():
     """
-    Analyze sentiment of unprocessed news articles using FinBERT and store results directly in the news collection.
+    Analyze sentiment of unprocessed news articles and link the result back to the news collection.
     """
     try:
-        news_docs = fetch_unprocessed_news()
+        news_ref = db.collection("news")
+        docs = news_ref.where("sentiment_id", "==", None).stream()  # Only analyze if sentiment is missing
 
-        if not news_docs:
-            print("⚠️ No unprocessed news articles found.")
-            return
-
-        for news_doc in news_docs:
-            news_data = news_doc.to_dict()
-            news_id = news_doc.id
+        for doc in docs:
+            news_data = doc.to_dict()
+            news_id = doc.id
             content = news_data.get("content", "")
 
             if not content:
-                print(f"⚠️ No content for news ID: {news_id}")
+                print(f"⚠️ Skipping empty content for news ID: {news_id}")
                 continue
 
-            # Perform sentiment analysis with FinBERT
-            sentiment_results = sentiment_analyzer(content[:512])
-            sentiment_label = sentiment_results[0]["label"].lower()
-            sentiment_score = sentiment_results[0]["score"]
+            try:
+                # Perform sentiment analysis
+                result = sentiment_analyzer(content[:512])[0]
+                sentiment_label = result["label"].capitalize()
+                sentiment_score = round(result["score"], 4)
 
-            # Update sentiment directly in the news document
-            db.collection("news").document(news_id).update({
-                "sentiment": {
+                # Store sentiment in 'sentiment_analysis' collection
+                sentiment_doc = {
+                    "news_id": news_id,
                     "label": sentiment_label,
-                    "score": sentiment_score
+                    "score": sentiment_score,
+                    "analyzed_at": datetime.now().isoformat()
                 }
-            })
+                sentiment_ref = db.collection("sentiment_analysis").add(sentiment_doc)
+                sentiment_id = sentiment_ref[1].id  # Get the generated sentiment document ID
 
-            print(f"✅ Sentiment stored for news ID: {news_id} | {sentiment_label} ({sentiment_score})")
+                # Update the news document with sentiment_id
+                news_ref.document(news_id).update({
+                    "sentiment_id": sentiment_id
+                })
+
+                print(f"✅ Sentiment stored for news ID: {news_id} | {sentiment_label} ({sentiment_score})")
+
+            except Exception as sentiment_error:
+                print(f"❌ Error analyzing sentiment for news ID {news_id}: {sentiment_error}")
+
+        print("✅ Sentiment analysis and linking completed.")
 
     except Exception as e:
-        print(f"❌ Error in sentiment analysis: {e}")
+        print(f"❌ Error during sentiment analysis: {e}")
 
-
+# 🚀 Run sentiment analysis if the script is executed directly
 if __name__ == "__main__":
     analyze_sentiment_and_store()
