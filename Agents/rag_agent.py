@@ -5,17 +5,22 @@ from datetime import datetime
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import firestore, credentials
-from fuzzywuzzy import process
 
 # ✅ Load environment variables
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+from openai import OpenAI
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 if not openai.api_key:
     raise ValueError("❌ OPENAI_API_KEY not set in environment variables.")
 
 # 🔐 Initialize Firebase
 def initialize_firebase():
+    """
+    Initialize Firebase and return a Firestore client.
+    """
     primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
     fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
 
@@ -33,13 +38,16 @@ db = initialize_firebase()
 
 # 🔍 Load Stock Mapping Dynamically
 def load_stock_mapping():
+    """
+    Load stock mapping (e.g., company name to stock ticker) from Firestore.
+    """
     mapping = {}
     try:
         docs = db.collection("latest_economic_data").stream()
         for doc in docs:
             data = doc.to_dict()
             stock_ticker = doc.id.upper().strip() if doc.id else None
-            company_name = data.get("long_name", "").lower().strip()
+            company_name = data.get("long_name", "").lower().strip() if data.get("long_name") else None
             if stock_ticker:
                 mapping[stock_ticker] = stock_ticker
             if company_name:
@@ -53,6 +61,9 @@ STOCK_MAPPING = load_stock_mapping()
 
 # 📈 Fetch Stock Prices
 def fetch_closing_prices(stock_ticker):
+    """
+    Fetch the latest and previous closing prices for a given stock ticker.
+    """
     try:
         ticker = yf.Ticker(stock_ticker)
         hist = ticker.history(period="5d")
@@ -67,6 +78,9 @@ def fetch_closing_prices(stock_ticker):
 
 # 📰 Fetch Related News
 def fetch_related_news(stock_ticker):
+    """
+    Fetch related news articles for a given stock ticker from Firestore.
+    """
     try:
         econ_doc = db.collection("latest_economic_data").document(stock_ticker).get()
         if not econ_doc.exists:
@@ -80,88 +94,84 @@ def fetch_related_news(stock_ticker):
             if news_doc.exists:
                 news_articles.append(news_doc.to_dict())
         return news_articles
-
     except Exception as e:
         print(f"❌ Error fetching related news: {e}")
         return []
 
-# ✅ Define experiment start date
-EXPERIMENT_START_DATE = datetime(2025, 1, 18)
+import openai
 
-# 📝 Store Recommendation Results with experiment_day
-def store_recommendation(stock_ticker, recommendation, is_correct, latest_close, previous_close):
-    try:
-        today = datetime.now()
-        experiment_day = max(0, min((today - EXPERIMENT_START_DATE).days, 90))  # Ensure day is 0-90
-
-        db.collection("model_recommendations").add({
-            "stock_ticker": stock_ticker,
-            "recommendation": recommendation,
-            "is_correct": is_correct,
-            "latest_close": latest_close,
-            "previous_close": previous_close,
-            "timestamp": today.isoformat(),
-            "experiment_day": experiment_day
-        })
-        print(f"✅ Stored recommendation for {stock_ticker}: {recommendation} | Correct: {is_correct} | Day: {experiment_day}")
-
-    except Exception as e:
-        print(f"❌ Error storing recommendation: {e}")
-
-# 🧠 Generate Financial Recommendation
 def generate_rag_response(query, documents):
+    """
+    Generate a financial recommendation based on sentiment trends and context.
+    """
     try:
         if not documents:
             return "⚠️ No relevant data found for your query."
 
+        # Aggregate sentiment trends
+        sentiment_summary = {"positive": 0, "neutral": 0, "negative": 0}
+        for doc in documents:
+            sentiment_label = doc.get("sentiment_label", "neutral").lower()
+            sentiment_summary[sentiment_label] += 1
+
+        # Derive recommendation based on sentiment trends
+        if sentiment_summary["positive"] > sentiment_summary["negative"]:
+            recommendation = "Buy"
+        elif sentiment_summary["negative"] > sentiment_summary["positive"]:
+            recommendation = "Sell"
+        else:
+            recommendation = "Hold"
+
+        # Limit the number of documents and truncate content
+        max_documents = 5  # Include only the top 5 documents
+        truncated_documents = documents[:max_documents]
+
+        # Limit content length for each document
+        max_content_length = 500  # Limit content to 500 characters
         context = "\n\n".join([
             f"📰 **Title:** {doc.get('title', 'No Title')}\n"
-            f"📄 **Summary:** {doc.get('summary', 'No Summary')}\n"
-            f"📄 **Content:** {doc.get('content', 'No Content')}\n"
-            f"🟢 **Sentiment:** {doc.get('sentiment', {}).get('label', 'No Sentiment')} "
-            f"({doc.get('sentiment', {}).get('score', 'N/A')})"
-            for doc in documents if doc
+            f"📄 **Content:** {doc.get('content', 'No Content')[:max_content_length]}...\n"
+            f"🟢 **Sentiment:** {doc.get('sentiment_label', 'No Sentiment')} "
+            f"({doc.get('sentiment_score', 'N/A')})"
+            for doc in truncated_documents
         ])
 
-        prompt = (
-            f"You are a financial analyst. Analyze the following financial news and sentiment analysis to give a direct investment recommendation: **Buy**, **Hold**, or **Sell**.\n\n"
-            f"Consider recent news, sentiment trends, and market movements. Be decisive and explain the reasoning behind your recommendation.\n\n"
-            f"{context}\n\n"
-            f"❓ **Question:** {query}\n"
-            f"💡 **Answer (Buy, Hold, or Sell):**"
-        )
-
-        response = openai.ChatCompletion.create(
-            model="gpt-4o-mini",  # Use GPT-4 for more advanced responses
+        # OpenAI API call
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a highly skilled financial advisor."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": "You are a financial analyst."},
+                {"role": "user", "content": (
+                    f"Analyze the following financial news and sentiment data:\n\n"
+                    f"{context}\n\n"
+                    f"Based on the above, what is your recommendation for {query}? "
+                    f"(Buy, Hold, or Sell)"
+                )},
             ],
             max_tokens=500,
-            temperature=0.3
+            temperature=0.3,
         )
 
-        recommendation = response.choices[0].message.content.strip()
-        print(f"🤖 Model Recommendation: {recommendation}")
-        return recommendation
+        # Extract and return recommendation
+        recommendation_output = response.choices[0].message.content.strip()
+        print(f"🤖 Model Recommendation: {recommendation_output}")
+        return recommendation_output
 
     except Exception as e:
         print(f"❌ Error generating RAG response: {e}")
         return "⚠️ An error occurred. Please try again later."
 
+
 # 🚀 Main Execution
 if __name__ == "__main__":
-    user_query = "What is the latest news about Microsoft?"
-    stock_ticker = STOCK_MAPPING.get("microsoft", "MSFT")
-    print(f"🔍 Query: {user_query} for ticker: {stock_ticker}")
-
+    user_query = "What is the latest news about Tesla?"
+    stock_ticker = STOCK_MAPPING.get("tesla", "TSLA")
     related_news = fetch_related_news(stock_ticker)
     recommendation = generate_rag_response(user_query, related_news)
-    latest_close, previous_close = fetch_closing_prices(stock_ticker)
 
+    latest_close, previous_close = fetch_closing_prices(stock_ticker)
     if latest_close and previous_close:
         is_correct = latest_close > previous_close
-        store_recommendation(stock_ticker, recommendation, is_correct, latest_close, previous_close)
-        print(f"📊 Evaluation complete for {stock_ticker}: Correct = {is_correct}")
+        print(f"📊 Recommendation: {recommendation} | Correct: {is_correct}")
     else:
-        print(f"⚠️ Skipping evaluation due to missing price data for {stock_ticker}.")
+        print(f"⚠️ No stock price data available for {stock_ticker}.")
