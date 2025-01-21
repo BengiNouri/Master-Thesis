@@ -100,6 +100,10 @@ def fetch_related_news(stock_ticker):
 
 import openai
 
+import openai
+
+import openai
+
 def generate_rag_response(query, documents):
     """
     Generate a financial recommendation based on sentiment trends and context.
@@ -112,7 +116,11 @@ def generate_rag_response(query, documents):
         sentiment_summary = {"positive": 0, "neutral": 0, "negative": 0}
         for doc in documents:
             sentiment_label = doc.get("sentiment_label", "neutral").lower()
-            sentiment_summary[sentiment_label] += 1
+            sentiment_score = doc.get("sentiment_score", 0)
+            sentiment_summary[sentiment_label] += sentiment_score
+            print(f"📰 Title: {doc.get('title', 'No Title')}, Sentiment: {sentiment_label} ({sentiment_score})")
+
+        print(f"🟢 Sentiment Summary for Query: {sentiment_summary}")
 
         # Derive recommendation based on sentiment trends
         if sentiment_summary["positive"] > sentiment_summary["negative"]:
@@ -122,22 +130,17 @@ def generate_rag_response(query, documents):
         else:
             recommendation = "Hold"
 
-        # Limit the number of documents and truncate content
-        max_documents = 5  # Include only the top 5 documents
-        truncated_documents = documents[:max_documents]
-
-        # Limit content length for each document
-        max_content_length = 500  # Limit content to 500 characters
+        # Formulate context for OpenAI prompt
         context = "\n\n".join([
             f"📰 **Title:** {doc.get('title', 'No Title')}\n"
-            f"📄 **Content:** {doc.get('content', 'No Content')[:max_content_length]}...\n"
+            f"📄 **Content:** {doc.get('content', 'No Content')}\n"
             f"🟢 **Sentiment:** {doc.get('sentiment_label', 'No Sentiment')} "
             f"({doc.get('sentiment_score', 'N/A')})"
-            for doc in truncated_documents
+            for doc in documents if doc
         ])
 
-        # OpenAI API call
-        response = client.chat.completions.create(
+        # OpenAI API call with updated syntax
+        response = openai.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": "You are a financial analyst."},
@@ -161,6 +164,9 @@ def generate_rag_response(query, documents):
         print(f"❌ Error generating RAG response: {e}")
         return "⚠️ An error occurred. Please try again later."
 
+    except Exception as e:
+        print(f"❌ Error generating RAG response: {e}")
+        return "⚠️ An error occurred. Please try again later."
 
 # 🚀 Main Execution
 if __name__ == "__main__":
