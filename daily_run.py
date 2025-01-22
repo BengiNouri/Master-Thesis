@@ -72,6 +72,7 @@ db = initialize_firebase()
 def evaluate_recommendation(stock_ticker, recommendation):
     """
     Compare today's close vs. yesterday's close to see if the recommendation is correct.
+    (Buy/Hold implies the price should be up; Sell implies the price should be down.)
     """
     latest_close, previous_close = fetch_closing_prices(stock_ticker)
     if not latest_close or not previous_close:
@@ -160,7 +161,7 @@ def run_daily_pipeline(stock_tickers, articles_per_stock=5):
         analyze_sentiment_and_store()
         
         # 4) Migrate any leftover sentiment docs
-        migrate_sentiment()  # This is now imported correctly from sentiment_agent
+        migrate_sentiment()
         
         # 5) Gather processed articles for this stock
         related_news_query = db.collection("news").where("economic_data_id", "==", stock)
@@ -182,7 +183,7 @@ def run_daily_pipeline(stock_tickers, articles_per_stock=5):
         else:
             print(f"🔀 GPT differs from aggregator. Aggregator={aggregator_rec}, GPT={gpt_rec}")
         
-        # Optional: Evaluate bullish vs. bearish difference via simple mapping
+        # Optional: Evaluate bullish vs. bearish difference via a simple mapping
         def rec_to_int(rec):
             return {"sell": -1, "hold": 0, "buy": 1}.get(rec.lower(), 0)
         agg_score = rec_to_int(aggregator_rec)
