@@ -5,12 +5,8 @@ from transformers import pipeline
 from datetime import datetime
 from dotenv import load_dotenv
 
-# Load environment variables (make sure you have a .env file if needed)
+# Load environment variables (ensure you have a .env file if needed)
 load_dotenv()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 🔐 Initialize Firebase
-# ─────────────────────────────────────────────────────────────────────────────
 
 def initialize_firebase():
     """
@@ -30,28 +26,18 @@ def initialize_firebase():
             cred = credentials.Certificate(fallback_path)
         else:
             raise FileNotFoundError("Firebase credentials file not found in any path.")
-        
         firebase_admin.initialize_app(cred)
-
     return firestore.client()
 
 db = initialize_firebase()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ✅ Initialize FinBERT Sentiment Analyzer
-# ─────────────────────────────────────────────────────────────────────────────
-
+# Initialize FinBERT Sentiment Analyzer
 sentiment_analyzer = pipeline("sentiment-analysis", model="ProsusAI/finbert")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ✅ Analyze Sentiment & Update Firestore "news" Collection
-# ─────────────────────────────────────────────────────────────────────────────
 
 def analyze_sentiment_and_store():
     """
-    1. Fetch 'news' docs that do NOT have sentiment fields.
-    2. Run FinBERT on each doc's 'content'.
-    3. Update the doc with 'sentiment_label', 'sentiment_score', and 'analyzed_at'.
+    Fetch 'news' documents without sentiment data, analyze their 'content' using FinBERT,
+    and update the document with 'sentiment_label', 'sentiment_score', and 'analyzed_at'.
     """
     try:
         news_ref = db.collection("news")
@@ -61,7 +47,7 @@ def analyze_sentiment_and_store():
             news_data = doc.to_dict()
             news_id = doc.id
 
-            # Skip if sentiment data exists
+            # Skip documents that already have sentiment data
             if "sentiment_label" in news_data and "sentiment_score" in news_data:
                 continue
 
@@ -71,13 +57,12 @@ def analyze_sentiment_and_store():
                 continue
 
             try:
-                # Use up to 512 characters (or tokens) for analysis
+                # Use up to 512 characters for analysis
                 snippet = content if len(content) < 512 else content[:512]
                 result = sentiment_analyzer(snippet)[0]
                 label = result.get("label", "Neutral").capitalize()
                 score = round(result.get("score", 0.0), 4)
 
-                # Update the news document
                 news_ref.document(news_id).update({
                     "sentiment_label": label,
                     "sentiment_score": score,
@@ -92,13 +77,9 @@ def analyze_sentiment_and_store():
     except Exception as e:
         print(f"❌ Error during sentiment analysis: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ✅ Verify News Sentiment (Optional)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def verify_sentiment_mapping():
     """
-    Check news docs that lack sentiment data and print their IDs.
+    Print a list of 'news' document IDs that lack sentiment data.
     """
     try:
         missing_sentiments = []
@@ -114,15 +95,10 @@ def verify_sentiment_mapping():
     except Exception as e:
         print(f"❌ Error verifying sentiment mapping: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ✅ Migrate Sentiment from 'sentiment_analysis' to 'news'
-# ─────────────────────────────────────────────────────────────────────────────
-
 def migrate_sentiment():
     """
-    For each doc in 'sentiment_analysis':
-      - Find the corresponding 'news' document by 'news_id'
-      - Update that 'news' document with the sentiment fields.
+    For each document in 'sentiment_analysis', find the corresponding 'news' document (via 'news_id')
+    and update it with sentiment fields.
     """
     sentiment_ref = db.collection("sentiment_analysis")
     docs = sentiment_ref.stream()
@@ -133,12 +109,10 @@ def migrate_sentiment():
         if not news_id:
             print(f"❌ No 'news_id' for sentiment doc {sdoc.id}, skipping.")
             continue
-
         try:
             label = sdata.get("label", "Neutral")
             score = sdata.get("score", 0.0)
             analyzed_at = sdata.get("analyzed_at", None)
-
             db.collection("news").document(news_id).update({
                 "sentiment_label": label,
                 "sentiment_score": score,
@@ -148,12 +122,28 @@ def migrate_sentiment():
             print(f"✅ Merged sentiment into news doc {news_id} ({label}, {score})")
         except Exception as e:
             print(f"❌ Error merging doc {sdoc.id}: {e}")
-
     if merged_count == 0:
         print("⚠️ No leftover sentiment docs found, or all had missing news_id.")
     else:
         print(f"🔗 Merged {merged_count} docs from 'sentiment_analysis' into 'news'!")
 
+def is_article_processed(article_id):
+    """
+    Return True if the 'news' document with the given article_id contains both
+    'sentiment_label' and 'sentiment_score' fields.
+    """
+    try:
+        doc_snapshot = db.collection("news").document(article_id).get()
+        if not doc_snapshot.exists:
+            return False
+        data = doc_snapshot.to_dict()
+        return "sentiment_label" in data and "sentiment_score" in data
+    except Exception as e:
+        print(f"❌ Error checking article {article_id}: {e}")
+        return False
+
 if __name__ == "__main__":
     analyze_sentiment_and_store()
     verify_sentiment_mapping()
+    # Optionally, run migrate_sentiment() here if you want to test migration separately:
+    # migrate_sentiment()
