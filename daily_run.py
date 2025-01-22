@@ -21,6 +21,8 @@ import torch
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
+if not openai.api_key:
+    raise ValueError("❌ OPENAI_API_KEY not set in environment variables.")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Suppress warnings
@@ -62,12 +64,6 @@ def initialize_firebase():
     return firestore.client()
 
 db = initialize_firebase()
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Migrate sentiment from 'sentiment_analysis' to 'news' (if any leftover)
-# ─────────────────────────────────────────────────────────────────────────────
-# Note: We now import migrate_sentiment from Agents.sentiment_agent,
-# so no local definition is necessary.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Evaluate Recommendation Correctness
@@ -164,7 +160,7 @@ def run_daily_pipeline(stock_tickers, articles_per_stock=5):
         analyze_sentiment_and_store()
         
         # 4) Migrate any leftover sentiment docs
-        migrate_sentiment()
+        migrate_sentiment()  # This is now imported correctly from sentiment_agent
         
         # 5) Gather processed articles for this stock
         related_news_query = db.collection("news").where("economic_data_id", "==", stock)
@@ -201,7 +197,7 @@ def run_daily_pipeline(stock_tickers, articles_per_stock=5):
         # 7) Evaluate recommendation correctness vs. actual stock prices
         is_correct, latest_close, previous_close = evaluate_recommendation(stock, gpt_rec)
         
-        # 8) Store recommendation in Firestore
+        # 8) Store the recommendation in Firestore
         store_recommendation(stock, aggregator_rec, gpt_rec, sentiment_sum, is_correct, latest_close, previous_close)
     
     print("\n✅ Daily Pipeline Workflow completed successfully!")
