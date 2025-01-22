@@ -7,7 +7,7 @@ import firebase_admin
 from firebase_admin import firestore, credentials
 from dotenv import load_dotenv
 
-# TensorFlow and Torch configuration to suppress warnings
+# Suppress TensorFlow and Torch warnings
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import tensorflow as tf
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
@@ -19,64 +19,73 @@ torch._C._jit_set_profiling_mode(False)
 load_dotenv()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-# Add root directory to sys.path
+# Add root directory to sys.path if needed (for module imports)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Import sentiment analysis
-from Agents.sentiment_agent import analyze_sentiment_and_store
-
+# ─────────────────────────────────────────────────────────────────────────────
 # 🔐 Initialize Firebase
+# ─────────────────────────────────────────────────────────────────────────────
+
 def initialize_firebase():
     """
-    Initialize Firebase with fallback paths.
+    Initialize Firebase using fallback paths for the credentials.
+    Returns a Firestore client.
     """
     primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
     fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
 
     if not firebase_admin._apps:
         cred_path = primary_path if os.path.exists(primary_path) else fallback_path
+        if not os.path.exists(cred_path):
+            raise FileNotFoundError(f"❌ Firebase credentials not found in {cred_path}")
         cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred)
-
     return firestore.client()
 
-# Initialize Firebase
 db = initialize_firebase()
 
+# ─────────────────────────────────────────────────────────────────────────────
 # ✅ Build Stock Mapping
+# ─────────────────────────────────────────────────────────────────────────────
+
 def build_stock_mapping():
     """
-    Build mapping between company names and stock tickers from Firestore.
+    Build a mapping between company names and stock tickers from the Firestore
+    'latest_economic_data' collection.
     """
-    stock_mapping = {}
+    mapping = {}
     try:
         docs = db.collection("latest_economic_data").stream()
         for doc in docs:
             data = doc.to_dict()
             company_name = data.get("long_name")
             stock_ticker = data.get("stock_ticker")
-
             if company_name and stock_ticker:
-                stock_mapping[company_name.lower().strip()] = stock_ticker.upper().strip()
-                stock_mapping[stock_ticker.lower().strip()] = stock_ticker.upper().strip()
+                mapping[company_name.lower().strip()] = stock_ticker.upper().strip()
+                mapping[stock_ticker.lower().strip()] = stock_ticker.upper().strip()
             else:
                 print(f"⚠️ Skipped invalid or incomplete data: {data}")
-
         print("✅ Stock mapping loaded successfully from Firestore.")
     except Exception as e:
         print(f"❌ Error loading stock mapping: {e}")
-    return stock_mapping
+    return mapping
 
 STOCK_MAPPING = build_stock_mapping()
 
-# ✅ Fetch Stock Prices
+# ─────────────────────────────────────────────────────────────────────────────
+# 📈 Fetch Stock Prices
+# ─────────────────────────────────────────────────────────────────────────────
+
 def fetch_closing_prices(stock_ticker):
     """
-    Fetch the latest and previous closing prices for a stock.
+    Fetch the latest and previous closing prices for the given stock ticker using yfinance.
     """
     try:
         ticker = yf.Ticker(stock_ticker)
         hist = ticker.history(period="5d")
+        if hist.empty or len(hist) < 2:
+            print(f"⚠️ Not enough historical data for {stock_ticker}")
+            return None, None
         latest_close = hist['Close'].iloc[-1]
         previous_close = hist['Close'].iloc[-2]
         return latest_close, previous_close
@@ -84,15 +93,18 @@ def fetch_closing_prices(stock_ticker):
         print(f"❌ Error fetching closing prices for {stock_ticker}: {e}")
         return None, None
 
-# ✅ Fetch News Articles
+# ─────────────────────────────────────────────────────────────────────────────
+# 📰 Fetch News Articles using NewsAPI
+# ─────────────────────────────────────────────────────────────────────────────
+
 def fetch_news_articles(keywords, page_size=10):
     """
-    Fetch news articles using NewsAPI.
+    Fetch news articles from NewsAPI using the provided keywords.
+    Returns a list of article dictionaries.
     """
     try:
         if not NEWS_API_KEY:
             raise ValueError("NEWS_API_KEY is not set.")
-        
         query = " OR ".join(keywords)
         params = {
             "q": query,
@@ -108,10 +120,13 @@ def fetch_news_articles(keywords, page_size=10):
         print(f"❌ Error fetching news articles: {e}")
         return []
 
+# ─────────────────────────────────────────────────────────────────────────────
 # ✅ Store Data in Firestore
+# ─────────────────────────────────────────────────────────────────────────────
+
 def store_in_firebase(collection_name, data):
     """
-    Store documents in the specified Firestore collection.
+    Store each document from the data list into the specified Firestore collection.
     """
     try:
         for item in data:
@@ -122,17 +137,19 @@ def store_in_firebase(collection_name, data):
     except Exception as e:
         print(f"❌ Error storing data: {e}")
 
+# ─────────────────────────────────────────────────────────────────────────────
 # ✅ Link News to Economic Data
+# ─────────────────────────────────────────────────────────────────────────────
+
 def link_news_to_economic_data(news_id, keyword):
     """
-    Link news articles to economic data.
+    Link a news article (by its ID) to economic data based on the provided keyword.
     """
     try:
         stock_ticker = STOCK_MAPPING.get(keyword.lower())
         if not stock_ticker:
             print(f"⚠️ No stock ticker found for '{keyword}'.")
             return
-
         db.collection("latest_economic_data").document(stock_ticker).update({
             "linked_news_ids": firestore.ArrayUnion([news_id])
         })
@@ -143,46 +160,17 @@ def link_news_to_economic_data(news_id, keyword):
     except Exception as e:
         print(f"❌ Error linking news to economic data: {e}")
 
-# ✅ Evaluate Recommendations
-def evaluate_recommendation(stock_ticker, recommendation):
-    """
-    Evaluate if the recommendation was correct.
-    """
-    latest_close, previous_close = fetch_closing_prices(stock_ticker)
-    if not latest_close or not previous_close:
-        return False, latest_close, previous_close
+# ─────────────────────────────────────────────────────────────────────────────
+# ✅ Process Articles: Fetch from NewsAPI and Store in Firestore "news"
+# ─────────────────────────────────────────────────────────────────────────────
 
-    price_movement = "up" if latest_close > previous_close else "down"
-    is_correct = ((recommendation.lower() in ["buy", "hold"] and price_movement == "up") or
-                  (recommendation.lower() == "sell" and price_movement == "down"))
-    return is_correct, latest_close, previous_close
-
-# ✅ Store Recommendation Results
-def store_recommendation(stock_ticker, recommendation, is_correct, latest_close, previous_close):
-    """
-    Store model recommendations in Firestore.
-    """
-    try:
-        db.collection("model_recommendations").add({
-            "stock_ticker": stock_ticker,
-            "recommendation": recommendation,
-            "is_correct": is_correct,
-            "latest_close": latest_close,
-            "previous_close": previous_close,
-            "timestamp": datetime.now().isoformat()
-        })
-        print(f"✅ Stored recommendation for {stock_ticker}: {recommendation} | Correct: {is_correct}")
-    except Exception as e:
-        print(f"❌ Error storing recommendation: {e}")
-
-# ✅ Process Articles Workflow
 def process_articles(keywords, page_size=10):
     """
-    Fetch, store, analyze, and link news articles.
+    Fetch new articles from the NewsAPI using the provided keywords, structure them,
+    and store them in the Firestore "news" collection.
     """
     print(f"🔎 Fetching news articles for: {keywords}")
     articles = fetch_news_articles(keywords, page_size)
-
     if not articles:
         print("⚠️ No articles found.")
         return
@@ -195,27 +183,18 @@ def process_articles(keywords, page_size=10):
             "publishedAt": article.get("publishedAt"),
             "source": article.get("source", {}).get("name"),
             "keywords": keywords,
-            "sentiment_id": None,
             "economic_data_id": None
         }
         for article in articles
     ]
 
     store_in_firebase("news", structured_articles)
-    analyze_sentiment_and_store()
+    print(f"✅ Stored {len(structured_articles)} articles in Firestore.")
 
-    for article in structured_articles:
-        for keyword in keywords:
-            link_news_to_economic_data(article["doc_id"], keyword)
+# ─────────────────────────────────────────────────────────────────────────────
+# 🚀 Main Execution (News Agent)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    for keyword in keywords:
-        recommendation = "buy"  # Placeholder recommendation
-        is_correct, latest_close, previous_close = evaluate_recommendation(STOCK_MAPPING[keyword.lower()], recommendation)
-        store_recommendation(STOCK_MAPPING[keyword.lower()], recommendation, is_correct, latest_close, previous_close)
-
-    print("✅ Workflow completed successfully!")
-
-# 🚀 Main Execution
 if __name__ == "__main__":
     keywords = ["Tesla", "TSLA"]
     page_size = 5

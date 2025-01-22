@@ -7,24 +7,24 @@ import firebase_admin
 from firebase_admin import firestore, credentials
 
 # Agents
-from Agents.news_agent import process_articles, link_news_to_economic_data
-from Agents.rag_agent import generate_rag_response
-from Agents.sentiment_agent import analyze_sentiment_and_store
+from Agents.news_agent import process_articles, link_news_to_economic_data, fetch_closing_prices, STOCK_MAPPING
+from Agents.rag_agent import generate_rag_response, store_recommendation  
+from Agents.sentiment_agent import analyze_sentiment_and_store, migrate_sentiment, is_article_processed
 
 import warnings
 import tensorflow as tf
 import torch
 
-# ───────────────────────────────────────────────────────────────────────────────
-# ✅ Load environment variables
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Load environment variables
+# ─────────────────────────────────────────────────────────────────────────────
 
 load_dotenv()
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# ───────────────────────────────────────────────────────────────────────────────
-# ✅ Suppress Warnings
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Suppress warnings
+# ─────────────────────────────────────────────────────────────────────────────
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
@@ -32,15 +32,15 @@ warnings.filterwarnings("ignore", category=UserWarning)
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_set_profiling_mode(False)
 
-# ───────────────────────────────────────────────────────────────────────────────
-# ✅ Define experiment start date (for correctness tracking)
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Define experiment start date for tracking correctness
+# ─────────────────────────────────────────────────────────────────────────────
 
 EXPERIMENT_START_DATE = datetime(2025, 1, 18)
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 🔐 Initialize Firebase
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Initialize Firebase (if needed in this script)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def initialize_firebase():
     """
@@ -49,7 +49,6 @@ def initialize_firebase():
     vm_path = r"C:\MasterThesis\Keys.json"
     primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
     fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
-
     if not firebase_admin._apps:
         if os.path.exists(vm_path):
             cred = credentials.Certificate(vm_path)
@@ -60,137 +59,79 @@ def initialize_firebase():
         else:
             raise FileNotFoundError("Firebase credentials file not found.")
         firebase_admin.initialize_app(cred)
-
     return firestore.client()
 
 db = initialize_firebase()
 
-# ───────────────────────────────────────────────────────────────────────────────
-# ✅ Migrate Sentiment from 'sentiment_analysis' → 'news'
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Migrate sentiment from 'sentiment_analysis' to 'news' (if any leftover)
+# ─────────────────────────────────────────────────────────────────────────────
+# Note: We now import migrate_sentiment from Agents.sentiment_agent,
+# so no local definition is necessary.
 
-def migrate_sentiment():
-    """
-    For each doc in 'sentiment_analysis':
-      - find the corresponding 'news' doc by 'news_id'
-      - copy 'label', 'score', 'analyzed_at' into that 'news' document
-    """
-    sentiment_ref = db.collection("sentiment_analysis")
-    docs = sentiment_ref.stream()
-
-    merged_count = 0
-    for sdoc in docs:
-        sdata = sdoc.to_dict()
-        news_id = sdata.get("news_id")
-        if not news_id:
-            print(f"❌ No 'news_id' for sentiment doc {sdoc.id}, skipping.")
-            continue
-
-        try:
-            label = sdata.get("label", "Neutral")
-            score = sdata.get("score", 0.0)
-            analyzed_at = sdata.get("analyzed_at", None)
-
-            # Update the matching 'news' doc
-            db.collection("news").document(news_id).update({
-                "sentiment_label": label,
-                "sentiment_score": score,
-                "analyzed_at": analyzed_at
-            })
-
-            merged_count += 1
-            print(f"✅ Merged sentiment into news doc {news_id} ({label}, {score})")
-
-        except Exception as e:
-            print(f"❌ Error merging doc {sdoc.id}: {e}")
-
-    if merged_count == 0:
-        print("⚠️ No leftover sentiment docs found, or all had missing news_id.")
-    else:
-        print(f"🔗 Merged {merged_count} docs from 'sentiment_analysis' into 'news'!")
-
-# ───────────────────────────────────────────────────────────────────────────────
-# 📈 Fetch Stock Prices
-# ───────────────────────────────────────────────────────────────────────────────
-
-def fetch_closing_prices(stock_ticker):
-    """
-    Fetch the latest and previous closing prices for a stock (5-day range).
-    """
-    try:
-        ticker = yf.Ticker(stock_ticker)
-        hist = ticker.history(period="5d")
-        latest_close = hist['Close'].iloc[-1]
-        previous_close = hist['Close'].iloc[-2]
-        return latest_close, previous_close
-    except Exception as e:
-        print(f"❌ Error fetching stock data for {stock_ticker}: {e}")
-        return None, None
-
-# ───────────────────────────────────────────────────────────────────────────────
-# 📊 Evaluate Recommendation
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluate Recommendation Correctness
+# ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate_recommendation(stock_ticker, recommendation):
     """
-    Compare today's close vs. yesterday's close to see if the recommendation 
-    was 'correct' for the movement. (Buy/Hold implies up; Sell implies down).
+    Compare today's close vs. yesterday's close to see if the recommendation is correct.
     """
     latest_close, previous_close = fetch_closing_prices(stock_ticker)
     if not latest_close or not previous_close:
-        print(f"⚠️ Missing stock price data for {stock_ticker}. "
-              f"Latest: {latest_close}, Previous: {previous_close}")
+        print(f"⚠️ Missing stock price data for {stock_ticker}. Latest: {latest_close}, Previous: {previous_close}")
         return False, latest_close, previous_close
 
     price_movement = "up" if latest_close > previous_close else "down"
-    is_correct = (
-        (recommendation.lower() in ["buy", "hold"] and price_movement == "up")
-        or
-        (recommendation.lower() == "sell" and price_movement == "down")
-    )
-    
-    print(f"🔄 Stock Price for {stock_ticker}: "
-          f"Latest={latest_close}, Previous={previous_close}, Movement={price_movement}")
+    is_correct = ((recommendation.lower() in ["buy", "hold"] and price_movement == "up") or
+                  (recommendation.lower() == "sell" and price_movement == "down"))
+    print(f"🔄 Stock Price for {stock_ticker}: Latest={latest_close}, Previous={previous_close}, Movement={price_movement}")
     print(f"🔍 Recommendation Correctness: {is_correct}")
-    
     return is_correct, latest_close, previous_close
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 📝 Store Recommendation Results
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Store Recommendation Results
+# ─────────────────────────────────────────────────────────────────────────────
 
-def store_recommendation(stock_ticker, short_rec, full_detail, is_correct, latest_close, previous_close):
+def store_recommendation(
+    stock_ticker,
+    aggregator_recommendation,
+    gpt_recommendation,
+    sentiment_summary,
+    is_correct,
+    latest_close,
+    previous_close,
+    full_text=""
+):
     """
-    Store two fields:
-      1. recommendation_summary: "Buy", "Sell", or "Hold"
-      2. recommendation_detail: your multi-paragraph explanation
+    Store the final recommendations, sentiment summary, and evaluation results in Firestore.
     """
     try:
         experiment_day = (datetime.now() - EXPERIMENT_START_DATE).days
         experiment_day = min(experiment_day, 90)
-
         db.collection("model_recommendations").add({
             "stock_ticker": stock_ticker,
-            "recommendation_summary": short_rec,   # single word
-            "recommendation_detail": full_detail,  # big text
+            "aggregator_recommendation": aggregator_recommendation,
+            "gpt_recommendation": gpt_recommendation,
+            "sentiment_summary": sentiment_summary,
+            "recommendation_detail": full_text,
             "is_correct": is_correct,
             "latest_close": latest_close,
             "previous_close": previous_close,
             "timestamp": datetime.now().isoformat(),
             "experiment_day": experiment_day
         })
-        print(f"✅ Stored recommendation for {stock_ticker}: {short_rec} | Correct: {is_correct}")
+        print(f"✅ Stored recommendation for {stock_ticker}: GPT={gpt_recommendation}, Aggregator={aggregator_recommendation}, Correct={is_correct}")
     except Exception as e:
         print(f"❌ Error storing recommendation: {e}")
 
-
-# ───────────────────────────────────────────────────────────────────────────────
-# ✅ Check if Article Was Processed
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Check if a News Article Has Been Processed
+# ─────────────────────────────────────────────────────────────────────────────
 
 def is_article_processed(article_id):
     """
-    Return True if a 'news' doc has 'sentiment_label' & 'sentiment_score'.
+    Return True if the 'news' document with the given article_id has sentiment data.
     """
     try:
         doc_snapshot = db.collection("news").document(article_id).get()
@@ -199,117 +140,71 @@ def is_article_processed(article_id):
         data = doc_snapshot.to_dict()
         return ("sentiment_label" in data and "sentiment_score" in data)
     except Exception as e:
-        print(f"❌ Error checking if article {article_id} is processed: {e}")
+        print(f"❌ Error checking article {article_id}: {e}")
         return False
 
-# ───────────────────────────────────────────────────────────────────────────────
-# 🔄 Run Daily Pipeline
-# ───────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Run Daily Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_daily_pipeline(stock_tickers, articles_per_stock=5):
-    """
-    Steps:
-      1) Fetch & store new articles (process_articles).
-      2) Link them to the correct ticker (link_news_to_economic_data).
-      3) Run in-place sentiment analysis (analyze_sentiment_and_store).
-      4) [MIGRATE] Merge leftover docs from 'sentiment_analysis' => 'news'.
-      5) Fetch newly processed articles (with sentiment in 'news').
-      6) Generate RAG recommendation (now returns short_rec, detail_text).
-      7) Evaluate correctness & store recommendation (two fields).
-    """
     for stock in stock_tickers:
         print(f"\n🔍 Processing {stock}...")
-
+        
         # 1) Fetch & store new articles
-        try:
-            process_articles([stock], articles_per_stock)
-            print(f"🔎 Fetched up to {articles_per_stock} articles for {stock}")
-        except Exception as e:
-            print(f"❌ Error processing articles for {stock}: {e}")
+        process_articles([stock], articles_per_stock)
+        
+        # 2) Link articles to economic data
+        newly_stored = db.collection("news").where("keywords", "array_contains", stock).stream()
+        for doc in newly_stored:
+            if not doc.to_dict().get("economic_data_id"):
+                link_news_to_economic_data(doc.id, stock)
+        
+        # 3) Run sentiment analysis on the news articles
+        analyze_sentiment_and_store()
+        
+        # 4) Migrate any leftover sentiment docs
+        migrate_sentiment()
+        
+        # 5) Gather processed articles for this stock
+        related_news_query = db.collection("news").where("economic_data_id", "==", stock)
+        related_news = list(related_news_query.stream())
+        news_docs = [doc_snap.to_dict() for doc_snap in related_news if is_article_processed(doc_snap.id)]
+        if not news_docs:
+            print(f"📰 No processed articles for {stock}. Skipping recommendation.")
             continue
-
-        # 2) Link docs to correct ticker
-        try:
-            newly_stored = db.collection("news") \
-                .where("keywords", "array_contains", stock) \
-                .stream()
-            for doc in newly_stored:
-                doc_data = doc.to_dict()
-                if not doc_data.get("economic_data_id"):
-                    link_news_to_economic_data(doc.id, stock)
-        except Exception as e:
-            print(f"❌ Error linking news to economic data for {stock}: {e}")
-            continue
-
-        # 3) Run in-place sentiment analysis on 'news' docs
-        try:
-            analyze_sentiment_and_store()
-            print(f"🧠 Sentiment analysis completed for {stock}")
-        except Exception as e:
-            print(f"❌ Error running sentiment analysis for {stock}: {e}")
-            continue
-
-        # 4) Migrate leftover data from 'sentiment_analysis' => 'news'
-        try:
-            migrate_sentiment()
-        except Exception as e:
-            print(f"❌ Error migrating leftover sentiment docs: {e}")
-
-        # 5) Fetch newly processed articles for this ticker
-        try:
-            related_news_query = db.collection("news").where("economic_data_id", "==", stock)
-            related_news = list(related_news_query.stream())
-
-            news_docs = []
-            for doc_snap in related_news:
-                # Only include docs with 'sentiment_label' & 'sentiment_score'
-                if is_article_processed(doc_snap.id):
-                    news_docs.append(doc_snap.to_dict())
-
-            if not news_docs:
-                print(f"📰 No *processed* articles for {stock}. Skipping recommendation.")
-                continue
-
-            print(f"📰 {len(news_docs)} processed articles ready for RAG analysis for {stock}")
-        except Exception as e:
-            print(f"❌ Error fetching related news for {stock}: {e}")
-            continue
-
-        # 6) Generate RAG Recommendation (two outputs)
-        try:
-            short_rec, detail_text = generate_rag_response(f"What's the outlook for {stock}?", news_docs)
-            if "⚠️ No relevant data found" in detail_text:
-                print(f"📊 Recommendation for {stock}: {detail_text}. Skipping storage.")
-                continue
-
-            print(f"📊 Recommendation for {stock}: {short_rec}")
-        except Exception as e:
-            print(f"❌ Error generating recommendation for {stock}: {e}")
-            continue
-
-        # 7) Evaluate & Store Recommendation
-        try:
-            print(f"📊 Evaluating recommendation for {stock}...")
-            # Evaluate correctness using ONLY the short recommendation
-            is_correct, latest_close, previous_close = evaluate_recommendation(stock, short_rec)
-            print(f"✅ Evaluation for {stock}: Correct = {is_correct}, "
-                  f"Latest = {latest_close}, Previous = {previous_close}")
-
-            # Now store both short & detailed rec
-            store_recommendation(
-                stock_ticker=stock,
-                short_rec=short_rec,          # e.g. "Buy"
-                full_detail=detail_text,      # multi-paragraph explanation
-                is_correct=is_correct,
-                latest_close=latest_close,
-                previous_close=previous_close
-            )
-        except Exception as e:
-            print(f"❌ Error storing or evaluating recommendation for {stock}: {e}")
-
-# ───────────────────────────────────────────────────────────────────────────────
-# 🚀 Main Execution
-# ───────────────────────────────────────────────────────────────────────────────
+        
+        # 6) Generate recommendations using aggregated sentiment and GPT
+        aggregator_rec, gpt_rec, sentiment_sum = generate_rag_response(f"What's the outlook for {stock}?", news_docs)
+        print(f"Aggregator Recommendation: {aggregator_rec}")
+        print(f"GPT Recommendation: {gpt_rec}")
+        print(f"Sentiment Summary: {sentiment_sum}")
+        
+        # Optional: Compare aggregator vs. GPT recommendations
+        if aggregator_rec == gpt_rec:
+            print(f"✅ GPT agrees with aggregator: {gpt_rec}")
+        else:
+            print(f"🔀 GPT differs from aggregator. Aggregator={aggregator_rec}, GPT={gpt_rec}")
+        
+        # Optional: Evaluate bullish vs. bearish difference via simple mapping
+        def rec_to_int(rec):
+            return {"sell": -1, "hold": 0, "buy": 1}.get(rec.lower(), 0)
+        agg_score = rec_to_int(aggregator_rec)
+        gpt_score = rec_to_int(gpt_rec)
+        if gpt_score > agg_score:
+            print("GPT is more bullish than aggregator.")
+        elif gpt_score < agg_score:
+            print("GPT is more bearish than aggregator.")
+        else:
+            print("GPT has the same recommendation as aggregator.")
+        
+        # 7) Evaluate recommendation correctness vs. actual stock prices
+        is_correct, latest_close, previous_close = evaluate_recommendation(stock, gpt_rec)
+        
+        # 8) Store recommendation in Firestore
+        store_recommendation(stock, aggregator_rec, gpt_rec, sentiment_sum, is_correct, latest_close, previous_close)
+    
+    print("\n✅ Daily Pipeline Workflow completed successfully!")
 
 if __name__ == "__main__":
     stock_tickers = ["TSLA", "AAPL", "MSFT", "NVDA", "NVO"]
