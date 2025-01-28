@@ -103,11 +103,17 @@ def store_recommendation(
 ):
     """
     Store final recommendations, sentiment summary, and evaluation results in Firestore.
+    Also stores economic data separately in the 'economic_data' collection.
     """
     try:
         experiment_day = (datetime.now() - EXPERIMENT_START_DATE).days
         experiment_day = min(experiment_day, 90)
-        db.collection("model_recommendations").add({
+
+        # Calculate price change percentage
+        price_change = latest_close - previous_close if previous_close else 0
+
+        # Store in model_recommendations collection
+        recommendation_ref = db.collection("model_recommendations").add({
             "stock_ticker": stock_ticker,
             "aggregator_recommendation": aggregator_recommendation,
             "gpt_recommendation": gpt_recommendation,
@@ -119,8 +125,28 @@ def store_recommendation(
             "timestamp": datetime.now().isoformat(),
             "experiment_day": experiment_day
         })
+
+        # Store economic data separately
+        economic_data_ref = db.collection("economic_data").add({
+            "stock_ticker": stock_ticker,
+            "experiment_day": experiment_day,
+            "latest_close": latest_close,
+            "previous_close": previous_close,
+            "price_change": price_change,
+            "sentiment_summary": sentiment_summary,
+            "timestamp": datetime.now().isoformat(),
+            "recommendation_id": recommendation_ref[1].id  # Link economic data to recommendation
+        })
+
         if VERBOSE:
-            print(f"Stored for {stock_ticker}: GPT={gpt_recommendation}, Aggregator={aggregator_recommendation}, Correct={is_correct}")
+            print(f"\n ✅ Stored recommendation and economic data for {stock_ticker}:")
+            print(f"   ├── GPT: {gpt_recommendation}")
+            print(f"   ├── Aggregator: {aggregator_recommendation}")
+            print(f"   ├── Correct: {is_correct}")
+            print(f"   ├── Price Change: {price_change:.2f}%")
+            print(f"   ├── Stored in 'model_recommendations' -> ID: {recommendation_ref[1].id}")
+            print(f"   └── Stored in 'economic_data' -> ID: {economic_data_ref[1].id}")
+
     except Exception as e:
         print(f"❌ Error storing recommendation for {stock_ticker}: {e}")
 
@@ -160,7 +186,7 @@ def run_daily_pipeline(stock_tickers, articles_per_stock=20):
                 print(f"  • Linked news ID {doc.id} to {stock}")
         
         # 3) Run sentiment analysis and migrate leftovers
-        print("\n[Sentiment Analysis]")
+        print("D[Sentiment Analysis]")
         analyze_sentiment_and_store()
         migrate_sentiment()
         
