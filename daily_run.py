@@ -89,7 +89,7 @@ def evaluate_recommendation(stock_ticker, recommendation):
     return is_correct, latest_close, previous_close
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Store Recommendation Results
+# Store Recommendation Results (Optimized Output Format)
 # ─────────────────────────────────────────────────────────────────────────────
 def store_recommendation(
     stock_ticker,
@@ -110,7 +110,7 @@ def store_recommendation(
         experiment_day = min(experiment_day, 90)
 
         # Calculate price change percentage
-        price_change = latest_close - previous_close if previous_close else 0
+        price_change = ((latest_close - previous_close) / previous_close) * 100 if previous_close else 0
 
         # Store in model_recommendations collection
         recommendation_ref = db.collection("model_recommendations").add({
@@ -138,17 +138,36 @@ def store_recommendation(
             "recommendation_id": recommendation_ref[1].id  # Link economic data to recommendation
         })
 
-        if VERBOSE:
-            print(f"\n ✅ Stored recommendation and economic data for {stock_ticker}:")
-            print(f"   ├── GPT: {gpt_recommendation}")
-            print(f"   ├── Aggregator: {aggregator_recommendation}")
-            print(f"   ├── Correct: {is_correct}")
-            print(f"   ├── Price Change: {price_change:.2f}%")
-            print(f"   ├── Stored in 'model_recommendations' -> ID: {recommendation_ref[1].id}")
-            print(f"   └── Stored in 'economic_data' -> ID: {economic_data_ref[1].id}")
+        # Optimized Console Output
+        print(f"""
+⚠️ No leftover sentiment docs found, or all had missing news_id.
+
+🔎 **Aggregator Suggests:** {aggregator_recommendation}  
+🤖 **GPT Recommendation:** {gpt_recommendation} ({"✅ Aligned" if aggregator_recommendation == gpt_recommendation else "⚠️ Different"})  
+
+📊 **Sentiment Scores:**
+   - **Positive:** {sentiment_summary.get('positive', 0):.2f}%
+   - **Neutral:** {sentiment_summary.get('neutral', 0):.2f}%
+   - **Negative:** {sentiment_summary.get('negative', 0):.2f}%
+
+📈 **Stock: {stock_ticker}**
+   - **Latest Price:** {latest_close:.2f} ({'⬆' if latest_close > previous_close else '⬇'} {price_change:.2f}%)
+   - **Previous Price:** {previous_close:.2f}
+   - **{gpt_recommendation.capitalize()} Recommendation** {"✅ Correct" if is_correct else "❌ Incorrect"}
+
+🗄️ **Data Stored:**
+   - **Model Recommendations:** ID {recommendation_ref[1].id}
+   - **Economic Data:** ID {economic_data_ref[1].id}
+
+============================================================
+✅ Stored Data for {stock_ticker}: GPT={gpt_recommendation}, Aggregator={aggregator_recommendation}, Correct={is_correct}
+============================================================
+""")
 
     except Exception as e:
         print(f"❌ Error storing recommendation for {stock_ticker}: {e}")
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Check if a News Article Has Been Processed
@@ -183,64 +202,30 @@ def run_daily_pipeline(stock_tickers, articles_per_stock=20):
         for doc in newly_stored:
             if not doc.to_dict().get("economic_data_id"):
                 link_news_to_economic_data(doc.id, stock)
-                print(f"  • Linked news ID {doc.id} to {stock}")
         
         # 3) Run sentiment analysis and migrate leftovers
-        print("D[Sentiment Analysis]")
+        print("[Sentiment Analysis]")
         analyze_sentiment_and_store()
         migrate_sentiment()
         
-        # 4) Gather processed articles for this stock
-        related_news_query = db.collection("news").where("economic_data_id", "==", stock)
-        related_news = list(related_news_query.stream())
-        news_docs = [doc_snap.to_dict() for doc_snap in related_news if is_article_processed(doc_snap.id)]
+        # 4) Gather only processed articles for this stock
+        related_news = db.collection("news").where("economic_data_id", "==", stock).stream()
+        news_docs = [doc.to_dict() for doc in related_news if "sentiment_label" in doc.to_dict()]
+        
         if not news_docs:
-            print(f"No processed articles for {stock}. Skipping recommendation.")
+            print(f"⚠️ No processed articles for {stock}. Skipping recommendation.")
             continue
         
-        # 5) Generate recommendations using aggregated sentiment and GPT
-        print("\n[Recommendation]")
+        # 5) Generate recommendations
         aggregator_rec, gpt_rec, sentiment_sum = generate_rag_response(f"What's the outlook for {stock}?", news_docs)
-        print(f"  Aggregator Suggestion: {aggregator_rec}")
-        print(f"  GPT Final Recommendation: {gpt_rec}")
         
-        print("\n[Sentiment Summary]")
-        print(f"  {sentiment_sum}")
-        
-        # Compare recommendations
-        if aggregator_rec == gpt_rec:
-            print("\n✔ GPT agrees with aggregator.")
-        else:
-            print(f"\n✦ GPT differs from aggregator. (Aggregator: {aggregator_rec} | GPT: {gpt_rec})")
-        
-        # Evaluate bullish vs. bearish difference via a simple mapping
-        def rec_to_int(rec):
-            return {"sell": -1, "hold": 0, "buy": 1}.get(rec.lower(), 0)
-        agg_score = rec_to_int(aggregator_rec)
-        gpt_score = rec_to_int(gpt_rec)
-        if gpt_score > agg_score:
-            print("  GPT is more bullish than aggregator.")
-        elif gpt_score < agg_score:
-            print("  GPT is more bearish than aggregator.")
-        else:
-            print("  Recommendations are aligned in sentiment.")
-        
-        # 6) Evaluate recommendation correctness vs. actual stock prices
-        print("\n[Price Evaluation]")
+        # 6) Evaluate correctness vs. stock prices
         is_correct, latest_close, previous_close = evaluate_recommendation(stock, gpt_rec)
-        movement = "up" if latest_close > previous_close else "down"
-        print(f"  Latest Price: {latest_close}")
-        print(f"  Previous Price: {previous_close}")
-        print(f"  Price Movement: {movement}")
-        print(f"  Recommendation Result: {gpt_rec} -> Correct: {is_correct}")
-        
-        # 7) Store the recommendation in Firestore
+
+        # 7) Store final recommendation (Handles all logging)
         store_recommendation(stock, aggregator_rec, gpt_rec, sentiment_sum, is_correct, latest_close, previous_close)
-        print("="*60)
-        print(f"Stored data for {stock}: GPT={gpt_rec}, Aggregator={aggregator_rec}, Correct={is_correct}")
-        print("="*60)
     
-    print("\nDaily Pipeline Workflow completed successfully!")
+    print("\n✅ Daily Pipeline Workflow completed successfully!")
 
 
 if __name__ == "__main__":
