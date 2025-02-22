@@ -39,7 +39,7 @@ Master-Thesis/ ├── Agents/ │ ├── news_agent.py # Fetches articles 
 ### 3.1. Clone the Repository
 
 ```bash
-git clone https://github.com/YourUsername/Master-Thesis.git
+git clone https://github.com/BengiNouri/Master-Thesis.git
 cd Master-Thesis
 ```
 
