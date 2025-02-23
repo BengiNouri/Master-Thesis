@@ -68,7 +68,7 @@ These environment variables are used by various scripts (e.g., rag_agent.py, new
 
     Important: Keep your key JSON file out of public repos to avoid potential credential exposure.
 
-# Running the Pipeline
+# 4 Running the Pipeline
 
 Once everything is installed and configured:
 
@@ -82,7 +82,7 @@ This workflow will:
     Pass aggregated sentiment to GPT-4o-mini, which issues a Buy/Hold/Sell recommendation.
     Compare the recommendation to actual price movements (via yfinance), storing results back in Firestore.
 
-# Additional Notes
+# 5 Additional Notes
 
     Rate Limiting
     If you encounter Too Many Requests errors from yfinance, insert short time.sleep() calls in the main loop (e.g., daily_run.py) to avoid consecutive rapid requests.
@@ -97,7 +97,7 @@ This workflow will:
 
 
 
-# Contact
+# 6 Contact
 
 For questions, comments, or collaboration requests:
 
