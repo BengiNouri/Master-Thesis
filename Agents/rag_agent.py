@@ -134,7 +134,7 @@ def generate_rag_response(query, documents):
 
         # Using the new client instance and a supported model
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo",  # Change to 'gpt-4' if you have access
+            model="gpt-4o-mini",  # Change to 'gpt-4' if you have access
             messages=[{"role": "user", "content": user_prompt}],
             max_tokens=5,
             temperature=0
