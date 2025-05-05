@@ -126,11 +126,12 @@ def generate_rag_response(query, documents):
         doc_context = "\n".join(doc_lines)
 
         user_prompt = (
-            "You are a financial analyst. You MUST answer with exactly one word: Buy, Sell, or Hold.\n\n"
-            f"Aggregator-based recommendation (from sentiment scores): {aggregator_rec}\n\n"
-            f"Document Overviews:\n{doc_context}\n\n"
-            "Based on the above, give your final single-word recommendation (Buy, Sell, or Hold). No additional words."
-        )
+                "You are a financial analyst. Your task is to give a recommendation—Buy, or Sell, on the provided sentiment and context.\n\n"
+                f"Aggregator-based recommendation (from sentiment scores): {aggregator_rec}\n\n"
+                f"Document Overviews:\n{doc_context}\n\n"
+                "Based on the information above, provide your final recommendation (Buy, Sell) and justify it with clear, concise reasoning based on the sentiment analysis and document summaries."
+            )
+
 
         # Using the new client instance and a supported model
         response = client.chat.completions.create(
