@@ -1,11 +1,12 @@
 import os
 import sys
+import time
 import requests
 from datetime import datetime
-import yfinance as yf
 import firebase_admin
 from firebase_admin import firestore, credentials
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Suppress TensorFlow and Torch warnings
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -19,7 +20,7 @@ torch._C._jit_set_profiling_mode(False)
 load_dotenv()
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 
-# Add root directory to sys.path if needed (for module imports)
+# Add project root to sys.path if needed for imports
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -27,17 +28,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 # ─────────────────────────────────────────────────────────────────────────────
 
 def initialize_firebase():
-    """
-    Initialize Firebase using fallback paths for the credentials.
-    Returns a Firestore client.
-    """
-    primary_path = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
-    fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
-
+    primary = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
+    fallback = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
     if not firebase_admin._apps:
-        cred_path = primary_path if os.path.exists(primary_path) else fallback_path
+        cred_path = primary if os.path.exists(primary) else fallback
         if not os.path.exists(cred_path):
-            raise FileNotFoundError(f"❌ Firebase credentials not found in {cred_path}")
+            raise FileNotFoundError(f"Firebase credentials not found at {cred_path}")
         cred = credentials.Certificate(cred_path)
         firebase_admin.initialize_app(cred)
     return firestore.client()
@@ -49,23 +45,17 @@ db = initialize_firebase()
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_stock_mapping():
-    """
-    Build a mapping between company names and stock tickers from the Firestore
-    'latest_economic_data' collection.
-    """
     mapping = {}
     try:
-        docs = db.collection("latest_economic_data").stream()
-        for doc in docs:
+        for doc in db.collection("latest_economic_data").stream():
             data = doc.to_dict()
-            company_name = data.get("long_name")
-            stock_ticker = data.get("stock_ticker")
-            if company_name and stock_ticker:
-                mapping[company_name.lower().strip()] = stock_ticker.upper().strip()
-                mapping[stock_ticker.lower().strip()] = stock_ticker.upper().strip()
-            else:
-                print(f"⚠️ Skipped invalid or incomplete data: {data}")
-        print("✅ Stock mapping loaded successfully from Firestore.")
+            ticker = doc.id.upper().strip()
+            name = data.get("long_name", "").lower().strip()
+            if ticker:
+                mapping[ticker] = ticker
+            if name:
+                mapping[name] = ticker
+        print("✅ Stock mapping loaded.")
     except Exception as e:
         print(f"❌ Error loading stock mapping: {e}")
     return mapping
@@ -73,129 +63,88 @@ def build_stock_mapping():
 STOCK_MAPPING = build_stock_mapping()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 📈 Fetch Stock Prices
+# 🚀 NewsAPI fetch with retry/backoff
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_closing_prices(stock_ticker):
-    """
-    Fetch the latest and previous closing prices for the given stock ticker using yfinance.
-    """
-    try:
-        ticker = yf.Ticker(stock_ticker)
-        hist = ticker.history(period="5d")
-        if hist.empty or len(hist) < 2:
-            print(f"⚠️ Not enough historical data for {stock_ticker}")
-            return None, None
-        latest_close = hist['Close'].iloc[-1]
-        previous_close = hist['Close'].iloc[-2]
-        return latest_close, previous_close
-    except Exception as e:
-        print(f"❌ Error fetching closing prices for {stock_ticker}: {e}")
-        return None, None
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 📰 Fetch News Articles using NewsAPI
-# ─────────────────────────────────────────────────────────────────────────────
-
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(requests.exceptions.RequestException)
+)
 def fetch_news_articles(keywords, page_size=10):
-    """
-    Fetch news articles from NewsAPI using the provided keywords.
-    Returns a list of article dictionaries.
-    """
-    try:
-        if not NEWS_API_KEY:
-            raise ValueError("NEWS_API_KEY is not set.")
-        query = " OR ".join(keywords)
-        params = {
-            "q": query,
-            "apiKey": NEWS_API_KEY,
-            "language": "en",
-            "sortBy": "publishedAt",
-            "pageSize": page_size
-        }
-        response = requests.get("https://newsapi.org/v2/everything", params=params)
-        response.raise_for_status()
-        return response.json().get("articles", [])
-    except Exception as e:
-        print(f"❌ Error fetching news articles: {e}")
-        return []
+    if not NEWS_API_KEY:
+        raise ValueError("NEWS_API_KEY not set")
+    query = " OR ".join(keywords)
+    params = {
+        "q": query,
+        "apiKey": NEWS_API_KEY,
+        "language": "en",
+        "sortBy": "publishedAt",
+        "pageSize": page_size
+    }
+    resp = requests.get("https://newsapi.org/v2/everything", params=params, timeout=10)
+    resp.raise_for_status()
+    return resp.json().get("articles", [])
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ Store Data in Firestore
+# 🔍 Deduplicate by URL
 # ─────────────────────────────────────────────────────────────────────────────
 
-def store_in_firebase(collection_name, data):
-    """
-    Store each document from the data list into the specified Firestore collection.
-    """
-    try:
-        for item in data:
-            doc_ref = db.collection(collection_name).document()
-            item["doc_id"] = doc_ref.id
-            doc_ref.set(item)
-        print(f"✅ Stored {len(data)} documents in '{collection_name}'.")
-    except Exception as e:
-        print(f"❌ Error storing data: {e}")
+def url_exists(url: str) -> bool:
+    snaps = db.collection("news").where("url", "==", url).limit(1).get()
+    return len(snaps) > 0
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ✅ Link News to Economic Data
-# ─────────────────────────────────────────────────────────────────────────────
-
-def link_news_to_economic_data(news_id, keyword):
-    """
-    Link a news article (by its ID) to economic data based on the provided keyword.
-    """
-    try:
-        stock_ticker = STOCK_MAPPING.get(keyword.lower())
-        if not stock_ticker:
-            print(f"⚠️ No stock ticker found for '{keyword}'.")
-            return
-        db.collection("latest_economic_data").document(stock_ticker).update({
-            "linked_news_ids": firestore.ArrayUnion([news_id])
-        })
-        db.collection("news").document(news_id).update({
-            "economic_data_id": stock_ticker
-        })
-        print(f"🔗 Linked news ID {news_id} to {stock_ticker}")
-    except Exception as e:
-        print(f"❌ Error linking news to economic data: {e}")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ✅ Process Articles: Fetch from NewsAPI and Store in Firestore "news"
+# 📄 Process & store articles in batches
 # ─────────────────────────────────────────────────────────────────────────────
 
 def process_articles(keywords, page_size=10):
-    """
-    Fetch new articles from the NewsAPI using the provided keywords, structure them,
-    and store them in the Firestore "news" collection.
-    """
-    print(f"🔎 Fetching news articles for: {keywords}")
-    articles = fetch_news_articles(keywords, page_size)
-    if not articles:
-        print("⚠️ No articles found.")
+    print(f"🔎 Fetching news for: {keywords}")
+    try:
+        raw = fetch_news_articles(keywords, page_size)
+    except Exception as e:
+        print(f"❌ NewsAPI error: {e}")
         return
 
-    structured_articles = [
-        {
-            "title": article.get("title"),
-            "content": article.get("content"),
-            "url": article.get("url"),
-            "publishedAt": article.get("publishedAt"),
-            "source": article.get("source", {}).get("name"),
-            "keywords": keywords,
-            "economic_data_id": None
+    if not raw:
+        print("⚠️ No articles returned from NewsAPI.")
+        return
+
+    batch = db.batch()
+    count = 0
+
+    for art in raw:
+        url = art.get("url")
+        if not url or url_exists(url):
+            continue
+
+        tag = keywords[0].strip().upper()
+        econ_id = STOCK_MAPPING.get(tag.lower(), tag)
+
+        doc_ref = db.collection("news").document()
+        payload = {
+            "title": art.get("title"),
+            "content": art.get("content"),
+            "url": url,
+            "publishedAt": art.get("publishedAt"),
+            "source": art.get("source", {}).get("name"),
+            "keywords": [k.lower().strip() for k in keywords],
+            "economic_data_id": econ_id,
+            "sentiment_label": None,
+            "sentiment_score": None,
+            "analyzed_at": None
         }
-        for article in articles
-    ]
+        batch.set(doc_ref, payload)
+        count += 1
 
-    store_in_firebase("news", structured_articles)
-    print(f"✅ Stored {len(structured_articles)} articles in Firestore.")
+        if count % 500 == 0:
+            batch.commit()
+            batch = db.batch()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 🚀 Main Execution (News Agent)
-# ─────────────────────────────────────────────────────────────────────────────
+    if count % 500 != 0:
+        batch.commit()
+
+    print(f"✅ Stored {count} new articles in 'news'.")
 
 if __name__ == "__main__":
-    keywords = ["Tesla", "TSLA"]
-    page_size = 5
-    process_articles(keywords, page_size)
+    process_articles(["Tesla", "TSLA"], page_size=5)

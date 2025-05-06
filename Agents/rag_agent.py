@@ -4,20 +4,24 @@ from dotenv import load_dotenv
 import yfinance as yf
 import firebase_admin
 from firebase_admin import firestore, credentials
+from openai import OpenAI
+from httpx import ReadTimeout
+import logging
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
-# Load environment variables
+# ─────────────────────────────────────────────────────────────────────────────
+# Load environment variables & initialize OpenAI client
+# ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
-# Verify that the API key is loaded
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     raise ValueError("❌ OPENAI_API_KEY not set in environment variables")
-else:
-    print("OPENAI_API_KEY loaded successfully.")
 
-# Use the new client instance approach
-from openai import OpenAI
 client = OpenAI(api_key=api_key)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Firebase initialization
+# ─────────────────────────────────────────────────────────────────────────────
 def initialize_firebase():
     """
     Initialize Firebase and return a Firestore client.
@@ -32,33 +36,43 @@ def initialize_firebase():
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
+# Singleton Firestore client
 db = initialize_firebase()
 
-def load_stock_mapping():
-    """
-    Load mapping (e.g., company name to stock ticker) from Firestore.
-    """
-    mapping = {}
-    try:
-        docs = db.collection("latest_economic_data").stream()
-        for doc in docs:
-            data = doc.to_dict()
-            stock_ticker = doc.id.upper().strip() if doc.id else None
-            company_name = data.get("long_name", "").lower().strip() if data.get("long_name") else None
-            if stock_ticker:
-                mapping[stock_ticker] = stock_ticker
-            if company_name:
-                mapping[company_name] = stock_ticker
-        print("✅ Stock mapping loaded from Firestore.")
-    except Exception as e:
-        print(f"⚠️ Error loading stock mapping: {e}")
-    return mapping
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: resolve ticker from name or symbol
+# ─────────────────────────────────────────────────────────────────────────────
+def resolve_stock_ticker(name_or_ticker: str) -> str:
+    key = name_or_ticker.strip().upper()
+    doc = db.collection("latest_economic_data").document(key).get()
+    if doc.exists:
+        return key
+    snaps = (
+        db.collection("latest_economic_data")
+          .where("long_name", "==", name_or_ticker.lower().strip())
+          .limit(1)
+          .get()
+    )
+    if snaps:
+        return snaps[0].id
+    return key
 
-STOCK_MAPPING = load_stock_mapping()
+# ─────────────────────────────────────────────────────────────────────────────
+# Fetch closing prices with retry on rate-limits
+# ─────────────────────────────────────────────────────────────────────────────
+class RateLimitError(Exception):
+    pass
 
-def fetch_closing_prices(stock_ticker):
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=2, max=10),
+    retry=retry_if_exception_type(RateLimitError),
+    reraise=True
+)
+def fetch_closing_prices(stock_ticker: str):
     """
-    Fetch latest and previous closing prices for a stock using yfinance.
+    Return (latest_close, previous_close) or (None, None) if unavailable.
+    Retries up to 3 times on 429 errors.
     """
     try:
         ticker = yf.Ticker(stock_ticker)
@@ -66,100 +80,114 @@ def fetch_closing_prices(stock_ticker):
         if hist.empty or len(hist) < 2:
             print(f"⚠️ Not enough historical data for {stock_ticker}")
             return None, None
-        latest_close = hist['Close'].iloc[-1]
-        previous_close = hist['Close'].iloc[-2]
-        return latest_close, previous_close
+        return hist['Close'].iloc[-1], hist['Close'].iloc[-2]
     except Exception as e:
-        print(f"❌ Error fetching closing prices for {stock_ticker}: {e}")
+        msg = str(e)
+        if "429" in msg or "Rate limited" in msg:
+            raise RateLimitError(f"Rate-limited on {stock_ticker}")
+        logging.error(f"❌ Error fetching closing prices for {stock_ticker}: {e}")
         return None, None
 
-def fetch_related_news(stock_ticker):
+# ─────────────────────────────────────────────────────────────────────────────
+# Fetch related news from Firestore
+# ─────────────────────────────────────────────────────────────────────────────
+def fetch_related_news(stock_ticker: str):
     """
-    Fetch related news articles for a given stock ticker from Firestore.
+    Pull all news articles linked to the given economic_data document.
     """
-    try:
-        econ_doc = db.collection("latest_economic_data").document(stock_ticker).get()
-        if not econ_doc.exists:
-            print(f"⚠️ No economic data found for {stock_ticker}.")
-            return []
-        linked_news_ids = econ_doc.to_dict().get("linked_news_ids", [])
-        news_articles = []
-        for news_id in linked_news_ids:
-            news_doc = db.collection("news").document(news_id).get()
-            if news_doc.exists:
-                news_articles.append(news_doc.to_dict())
-        return news_articles
-    except Exception as e:
-        print(f"❌ Error fetching related news: {e}")
+    econ_doc = db.collection("latest_economic_data").document(stock_ticker).get()
+    if not econ_doc.exists:
+        print(f"⚠️ No economic data for {stock_ticker}")
         return []
+    linked_ids = econ_doc.to_dict().get("linked_news_ids", [])
+    articles = []
+    for nid in linked_ids:
+        ndoc = db.collection("news").document(nid).get()
+        if ndoc.exists:
+            articles.append(ndoc.to_dict())
+    return articles
 
-def generate_rag_response(query, documents):
+# ─────────────────────────────────────────────────────────────────────────────
+# Main RAG: recommendation + reasoning
+# ─────────────────────────────────────────────────────────────────────────────
+def generate_rag_response(query: str, documents: list):
     """
-    Returns a tuple: (aggregator_rec, gpt_rec, sentiment_summary)
+    Returns (aggregator_rec, gpt_rec, reasoning, sentiment_summary).
+    Reasoning is exactly two bullets with bolded score and label.
     """
     try:
-        if not documents:
-            print("⚠️ No relevant news docs found; defaulting to 'Hold'.")
-            return ("Hold", "Hold", {"positive": 0.0, "neutral": 0.0, "negative": 0.0})
+        # 1️⃣ Aggregate sentiment scores
+        summary = {"positive":0.0, "neutral":0.0, "negative":0.0}
+        for d in documents:
+            lbl = d.get("sentiment_label", "neutral").lower()
+            score = float(d.get("sentiment_score", 0.0))
+            summary[lbl] += score
 
-        sentiment_summary = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
-        for doc in documents:
-            label = doc.get("sentiment_label", "neutral").lower()
-            score = float(doc.get("sentiment_score", 0.0))
-            sentiment_summary[label] += score
+        # 2️⃣ Aggregator logic
+        if summary["positive"] > summary["negative"]:
+            agg = "Buy"
+        elif summary["negative"] > summary["positive"]:
+            agg = "Sell"
+        else:
+            agg = "Hold"
 
-        aggregator_rec = "Hold"
-        if sentiment_summary["positive"] > sentiment_summary["negative"]:
-            aggregator_rec = "Buy"
-        elif sentiment_summary["negative"] > sentiment_summary["positive"]:
-            aggregator_rec = "Sell"
-
-        print(f"🔎 Aggregator suggests: {aggregator_rec}")
-        print(f"🟢 Sentiment Summary: {sentiment_summary}")
-
-        doc_lines = []
+        # 3️⃣ Build context snippet (up to 4)
+        ctx_lines = []
         for d in documents[:4]:
             title = d.get("title", "No Title")
-            label = d.get("sentiment_label", "neutral").lower()
-            score = d.get("sentiment_score", 0.0)
-            doc_lines.append(f"- {title} ({label}, {score})")
-        doc_context = "\n".join(doc_lines)
+            score = float(d.get("sentiment_score",0.0))
+            label = d.get("sentiment_label", "Neutral")
+            ctx_lines.append(f"- {title} (**{score:.4f}**, {label})")
+        ctx = "\n".join(ctx_lines)
 
-        user_prompt = (
-                "You are a financial analyst. Your task is to give a recommendation—Buy, or Sell, on the provided sentiment and context.\n\n"
-                f"Aggregator-based recommendation (from sentiment scores): {aggregator_rec}\n\n"
-                f"Document Overviews:\n{doc_context}\n\n"
-                "Based on the information above, provide your final recommendation (Buy, Sell) and justify it with clear, concise reasoning based on the sentiment analysis and document summaries."
-            )
-
-
-        # Using the new client instance and a supported model
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",  # Change to 'gpt-4' if you have access
-            messages=[{"role": "user", "content": user_prompt}],
-            max_tokens=5,
-            temperature=0
+        # 4️⃣ Strict prompt format
+        prompt = (
+            "You are a seasoned financial analyst.\n\n"
+            f"Aggregator signal: {agg}\n\n"
+            "Top articles (title, bold score, label):\n"
+            f"{ctx}\n\n"
+            "Answer in exactly this format:\n"
+            "Recommendation: <Buy/Sell/Hold>  (one sentence)\n"
+            "Reasoning:\n"
+            "- <Title 1> (**X.XXXX**, Label): …how this supports your view\n"
+            "- <Title 2> (**Y.YYYY**, Label): …how this supports your view"
         )
 
-        gpt_raw = response.choices[0].message.content.strip()
-        gpt_clean = gpt_raw.replace(".", "").strip().capitalize()
-        if gpt_clean not in ["Buy", "Sell", "Hold"]:
-            gpt_clean = "Hold"
+        logging.info("🛰️ Sending prompt to OpenAI…")
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"user","content":prompt}],
+            max_tokens=200,
+            temperature=0,
+            timeout=15
+        )
+        out = resp.choices[0].message.content.strip()
+        logging.info(f"🛰️ OpenAI returned: {out!r}")
 
-        print(f"🤖 GPT Final Recommendation: {gpt_clean}")
-        return (aggregator_rec, gpt_clean, sentiment_summary)
+        # 5️⃣ Parse recommendation
+        rec_line = next((l for l in out.splitlines()
+                         if l.lower().startswith("recommendation:")), "")
+        rec = rec_line.split(":",1)[-1].strip().capitalize() or agg
 
+        # 6️⃣ Parse two reasoning bullets
+        bullets = [l for l in out.splitlines() if l.strip().startswith("- ")][:2]
+        reasoning = "\n".join(bullets) if bullets else "No reasoning."
+
+        return agg, rec, reasoning, summary
+
+    except ReadTimeout:
+        logging.error("⏰ OpenAI request timed out")
+        return agg, "Hold", "- **AI timed out**—please try again.", summary
     except Exception as e:
-        print(f"❌ Error in generate_rag_response: {e}")
-        return ("Hold", "Hold", {"positive": 0.0, "neutral": 0.0, "negative": 0.0})
+        logging.exception("❌ RAG agent failed")
+        return "Hold", "Hold", "- **Error generating reasoning**.", {"positive":0, "neutral":0, "negative":0}
 
-def store_recommendation(stock_ticker, aggregator_rec, gpt_rec, sentiment_sum):
-    """
-    Store the combined recommendations in Firestore under the 'recommendations' collection.
-    """
+# ─────────────────────────────────────────────────────────────────────────────
+# Store recommendation in Firestore
+# ─────────────────────────────────────────────────────────────────────────────
+def store_recommendation(stock_ticker: str, aggregator_rec: str, gpt_rec: str, sentiment_sum: dict):
     try:
-        rec_doc = db.collection("recommendations").document(stock_ticker)
-        rec_doc.set({
+        db.collection("recommendations").document(stock_ticker).set({
             "aggregator_rec": aggregator_rec,
             "gpt_rec": gpt_rec,
             "sentiment_sum": sentiment_sum,
@@ -167,36 +195,29 @@ def store_recommendation(stock_ticker, aggregator_rec, gpt_rec, sentiment_sum):
         })
         print(f"✅ Stored recommendation for {stock_ticker}: {aggregator_rec} | {gpt_rec}")
     except Exception as e:
-        print(f"❌ Error storing recommendation for {stock_ticker}: {e}")
+        logging.error(f"❌ Error storing recommendation for {stock_ticker}: {e}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Example / debug run
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Example query for Tesla (TSLA)
-    user_query = "What is the latest news about Tesla?"
-    stock_ticker = STOCK_MAPPING.get("tesla", "TSLA")
+    user_query   = "What is the latest news about Tesla?"
+    stock_ticker = resolve_stock_ticker("Tesla")
     related_news = fetch_related_news(stock_ticker)
-    
-    # Unpack three values from generate_rag_response
-    aggregator_rec, gpt_rec, sentiment_sum = generate_rag_response(user_query, related_news)
 
-    print(f"Aggregator Recommendation: {aggregator_rec}")
-    print(f"GPT Recommendation: {gpt_rec}")
-    print(f"Sentiment Summary: {sentiment_sum}")
+    agg, gpt, reason, summary = generate_rag_response(user_query, related_news)
+    print(f"Aggregator Recommendation: {agg}")
+    print(f"GPT Recommendation:        {gpt}")
+    print(f"Reasoning:                 {reason}")
+    print(f"Sentiment Summary:         {summary}")
 
-    # Compare the recommendations (optional)
-    if aggregator_rec == gpt_rec:
-        print(f"✅ GPT agrees with aggregator: {gpt_rec}")
-    else:
-        print(f"🔀 GPT differs from aggregator. Aggregator={aggregator_rec}, GPT={gpt_rec}")
-
-    # Optional: Evaluate correctness vs. price movement
-    latest_close, previous_close = fetch_closing_prices(stock_ticker)
-    if latest_close and previous_close:
-        is_correct = ((gpt_rec.lower() in ["buy", "hold"] and latest_close > previous_close) or
-                      (gpt_rec.lower() == "sell" and latest_close < previous_close))
-        print(f"📊 Recommendation correctness: {is_correct}")
-        print(f"Today's close: {latest_close}, Yesterday's close: {previous_close}")
+    latest, prev = fetch_closing_prices(stock_ticker)
+    if latest and prev:
+        correct = ((gpt.lower() in ["buy","hold"] and latest>prev) or
+                   (gpt.lower()=="sell" and latest<prev))
+        print(f"📊 Recommendation correctness: {correct}")
+        print(f"Today's close: {latest}, Yesterday's: {prev}")
     else:
         print(f"⚠️ No stock price data available for {stock_ticker}.")
 
-    # Store recommendation in Firestore
-    store_recommendation(stock_ticker, aggregator_rec, gpt_rec, sentiment_sum)
+    store_recommendation(stock_ticker, agg, gpt, summary)
