@@ -110,44 +110,38 @@ def fetch_related_news(stock_ticker: str):
 # ─────────────────────────────────────────────────────────────────────────────
 # Main RAG: recommendation + reasoning
 # ─────────────────────────────────────────────────────────────────────────────
-def generate_rag_response(query: str, documents: list):
+def generate_rag_response(query, documents):
     """
-    Returns (aggregator_rec, gpt_rec, reasoning, sentiment_summary).
-    Reasoning is exactly two bullets with bolded score and label.
+    Returns a tuple: (aggregator_rec, gpt_rec, reasoning, sentiment_summary)
+    Now forces only Buy/Sell (no Hold ever).
     """
     try:
-        # 1️⃣ Aggregate sentiment scores
-        summary = {"positive":0.0, "neutral":0.0, "negative":0.0}
+        # 1️⃣ Aggregate sentiment
+        summary = {"positive": 0.0, "neutral": 0.0, "negative": 0.0}
         for d in documents:
             lbl = d.get("sentiment_label", "neutral").lower()
-            score = float(d.get("sentiment_score", 0.0))
-            summary[lbl] += score
+            summary[lbl] += float(d.get("sentiment_score", 0.0))
 
-        # 2️⃣ Aggregator logic
-        if summary["positive"] > summary["negative"]:
-            agg = "Buy"
-        elif summary["negative"] > summary["positive"]:
-            agg = "Sell"
-        else:
-            agg = "Hold"
+        # 2️⃣ Aggregator logic → ONLY Buy or Sell
+        agg = "Buy" if summary["positive"] >= summary["negative"] else "Sell"
 
-        # 3️⃣ Build context snippet (up to 4)
+        # 3️⃣ Build context snippet (up to 4 articles)
         ctx_lines = []
         for d in documents[:4]:
             title = d.get("title", "No Title")
-            score = float(d.get("sentiment_score",0.0))
+            score = float(d.get("sentiment_score", 0.0))
             label = d.get("sentiment_label", "Neutral")
             ctx_lines.append(f"- {title} (**{score:.4f}**, {label})")
         ctx = "\n".join(ctx_lines)
 
-        # 4️⃣ Strict prompt format
+        # 4️⃣ Strict prompt, only allows Buy or Sell
         prompt = (
             "You are a seasoned financial analyst.\n\n"
-            f"Aggregator signal: {agg}\n\n"
+            f"Aggregator signal (Buy/Sell): {agg}\n\n"
             "Top articles (title, bold score, label):\n"
             f"{ctx}\n\n"
             "Answer in exactly this format:\n"
-            "Recommendation: <Buy/Sell/Hold>  (one sentence)\n"
+            "Recommendation: <Buy or Sell>  (one sentence)\n"
             "Reasoning:\n"
             "- <Title 1> (**X.XXXX**, Label): …how this supports your view\n"
             "- <Title 2> (**Y.YYYY**, Label): …how this supports your view"
@@ -156,7 +150,7 @@ def generate_rag_response(query: str, documents: list):
         logging.info("🛰️ Sending prompt to OpenAI…")
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0,
             timeout=15
@@ -164,23 +158,26 @@ def generate_rag_response(query: str, documents: list):
         out = resp.choices[0].message.content.strip()
         logging.info(f"🛰️ OpenAI returned: {out!r}")
 
-        # 5️⃣ Parse recommendation
+        # 5️⃣ Parse GPT's recommendation and force Buy/Sell
         rec_line = next((l for l in out.splitlines()
                          if l.lower().startswith("recommendation:")), "")
-        rec = rec_line.split(":",1)[-1].strip().capitalize() or agg
+        rec = rec_line.split(":", 1)[-1].strip().capitalize()
+        if rec not in ("Buy", "Sell"):
+            rec = agg
 
-        # 6️⃣ Parse two reasoning bullets
-        bullets = [l for l in out.splitlines() if l.strip().startswith("- ")][:2]
-        reasoning = "\n".join(bullets) if bullets else "No reasoning."
+        # 6️⃣ Extract exactly two bullets
+        bullets = [l for l in out.splitlines() if l.strip().startswith("- ")]
+        reasoning = "\n".join(bullets[:2]) if bullets else "No reasoning."
 
         return agg, rec, reasoning, summary
 
     except ReadTimeout:
         logging.error("⏰ OpenAI request timed out")
-        return agg, "Hold", "- **AI timed out**—please try again.", summary
-    except Exception as e:
+        return agg, agg, "- **AI timed out**—please try again.", summary
+    except Exception:
         logging.exception("❌ RAG agent failed")
-        return "Hold", "Hold", "- **Error generating reasoning**.", {"positive":0, "neutral":0, "negative":0}
+        # fallback to aggregator for both
+        return agg, agg, "- **Error generating reasoning**.", summary
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Store recommendation in Firestore
