@@ -2,7 +2,6 @@ import os
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# 🔐 Initialize Firebase
 def initialize_firebase():
     """
     Initialize Firebase with fallback paths.

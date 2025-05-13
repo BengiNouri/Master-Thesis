@@ -1,33 +1,48 @@
 import os
 import openai
-import yfinance as yf
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import firestore, credentials
 
+# External data sources
+import yfinance as yf
+from tiingo import TiingoClient
+
 # Agents
-from Agents.news_agent import process_articles, STOCK_MAPPING
-from Agents.rag_agent import fetch_closing_prices, generate_rag_response
+from Agents.news_agent import process_articles
+from Agents.rag_agent import generate_rag_response
 from Agents.sentiment_agent import analyze_sentiment_and_store, migrate_sentiment
 
 import warnings
 import tensorflow as tf
 import torch
+import time
+from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configurations
 # ─────────────────────────────────────────────────────────────────────────────
 VERBOSE = True
 EXPERIMENT_START_DATE = datetime(2025, 1, 22)
+RETRY_SLEEP_SECONDS = 60
+TIINGO_BACKFILL_DAYS = 7
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Load env & init OpenAI
+# Load environment & init clients
 # ─────────────────────────────────────────────────────────────────────────────
 load_dotenv()
+
+# OpenAI
 openai.api_key = os.getenv("OPENAI_API_KEY")
 if not openai.api_key:
     raise ValueError("❌ OPENAI_API_KEY not set.")
+
+# Tiingo
+TIINGO_API_KEY = os.getenv("TIINGO_API_KEY")
+if not TIINGO_API_KEY:
+    raise RuntimeError("❌ TIINGO_API_KEY not set in environment.")
+_tiingo_client = TiingoClient({"api_key": TIINGO_API_KEY, "session": True})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Suppress TF/torch warnings
@@ -42,134 +57,174 @@ torch._C._jit_set_profiling_mode(False)
 # Initialize Firebase
 # ─────────────────────────────────────────────────────────────────────────────
 def initialize_firebase():
-    vm_path       = r"C:\MasterThesis\Keys.json"
-    primary_path  = r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
-    fallback_path = r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json"
+    paths = [
+        r"C:\MasterThesis\Keys.json",
+        r"C:\Users\sajad\OneDrive\Skole\DevRepos\Master Thesis\Keys.json",
+        r"C:\Users\Benja\OneDrive\Skole\DevRepos\Master Thesis\Keys.json",
+    ]
     if not firebase_admin._apps:
-        if   os.path.exists(vm_path):       cred = credentials.Certificate(vm_path)
-        elif os.path.exists(primary_path):  cred = credentials.Certificate(primary_path)
-        elif os.path.exists(fallback_path): cred = credentials.Certificate(fallback_path)
-        else: raise FileNotFoundError("Firebase credentials not found.")
+        for p in paths:
+            if os.path.exists(p):
+                cred = credentials.Certificate(p)
+                break
+        else:
+            raise FileNotFoundError("Firebase credentials not found.")
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
 db = initialize_firebase()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helper: Link news → economic_data document
+# Price fetching: Tiingo first, then yfinance
 # ─────────────────────────────────────────────────────────────────────────────
-def link_news_to_economic_data(news_id: str, stock_ticker: str):
-    db.collection("latest_economic_data") \
-      .document(stock_ticker) \
-      .update({"linked_news_ids": firestore.ArrayUnion([news_id])})
-    db.collection("news").document(news_id).update({"economic_data_id": stock_ticker})
+class PriceFetchError(Exception): pass
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Evaluate Recommendation Correctness
-# ─────────────────────────────────────────────────────────────────────────────
-def evaluate_recommendation(stock_ticker, recommendation):
-    latest, prev = fetch_closing_prices(stock_ticker)
-    if latest is None or prev is None:
-        if VERBOSE:
-            print(f"⚠️ Missing price data for {stock_ticker}.")
-        return False, latest, prev
+@retry(
+    retry=retry_if_exception_type(Exception),
+    wait=wait_exponential(multiplier=1, min=5, max=60),
+    stop=stop_after_attempt(5),
+    reraise=True
+)
+def _fetch_with_yf(ticker):
+    data = yf.Ticker(ticker).history(period="5d")["Close"].dropna()
+    if len(data) < 2:
+        raise PriceFetchError(f"Insufficient yfinance data for {ticker}")
+    return float(data.iloc[-1]), float(data.iloc[-2])
 
-    moved_up = latest > prev
-    is_correct = (
-        (recommendation.lower() in ["buy","hold"] and moved_up) or
-        (recommendation.lower()=="sell" and not moved_up)
+
+def _fetch_with_tiingo(ticker):
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=TIINGO_BACKFILL_DAYS)
+    prices = _tiingo_client.get_ticker_price(
+        ticker,
+        startDate=start.isoformat(),
+        endDate=end.isoformat(),
+        frequency='daily'
     )
-    if VERBOSE:
-        arrow = "↑" if moved_up else "↓"
-        pct = (latest - prev) / prev * 100
-        print(f"{stock_ticker}: {prev:.2f}→{latest:.2f} ({arrow}{pct:.2f}%) rec={recommendation} → {is_correct}")
-    return is_correct, latest, prev
+    if not prices or len(prices) < 2:
+        raise PriceFetchError(f"Insufficient Tiingo data for {ticker}")
+    latest = prices[-1]['adjClose']
+    prev = prices[-2]['adjClose']
+    return float(latest), float(prev)
+
+
+def fetch_closing_prices(ticker):
+    """
+    Primary: Tiingo; fallback: yfinance
+    """
+    try:
+        return _fetch_with_tiingo(ticker)
+    except Exception as ti:
+        if VERBOSE:
+            print(f"⚠️ Tiingo failed for {ticker}: {ti}. Falling back to yfinance...")
+    try:
+        return _fetch_with_yf(ticker)
+    except Exception as yf:
+        raise PriceFetchError(f"Both price sources failed for {ticker}: ti={ti}, yf={yf}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Store Recommendation + Economic Data
+# Helpers: link
 # ─────────────────────────────────────────────────────────────────────────────
-def store_recommendation(
-    stock_ticker,
-    aggregator_recommendation,
-    gpt_recommendation,
-    sentiment_summary,
-    is_correct,
-    latest_close,
-    previous_close,
-    full_text=""
-):
+def link_news_to_economic_data(news_id, stock):
+    db.collection("latest_economic_data").document(stock).update({
+        "linked_news_ids": firestore.ArrayUnion([news_id])
+    })
+    db.collection("news").document(news_id).update({"economic_data_id": stock})
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Evaluate recommendation correctness
+# ─────────────────────────────────────────────────────────────────────────────
+def evaluate_model(stock, rec, model_name, latest, prev):
+    moved = latest > prev
+    correct = (rec.lower() in ["buy","hold"] and moved) or (rec.lower()=="sell" and not moved)
+    arrow = "↑" if moved else "↓"
+    pct = (latest - prev) / prev * 100 if prev else 0
+    print(f"{stock} [{model_name}]: {prev:.2f}→{latest:.2f} ({arrow}{pct:.2f}%) rec={rec} → {correct}")
+    return correct
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Store recommendation + economic data
+# ─────────────────────────────────────────────────────────────────────────────
+def store_recommendation(stock, agg_rec, gpt_rec, summary, corr, latest, prev, detail):
     experiment_day = min((datetime.now() - EXPERIMENT_START_DATE).days, 90)
-    price_change   = ((latest_close - previous_close) / previous_close * 100) if previous_close else 0
-
-    # Model recommendations
-    rec_ref = db.collection("model_recommendations").add({
-        "stock_ticker":              stock_ticker,
-        "aggregator_recommendation": aggregator_recommendation,
-        "gpt_recommendation":        gpt_recommendation,
-        "sentiment_summary":         sentiment_summary,
-        "recommendation_detail":     full_text,
-        "is_correct":                is_correct,
-        "latest_close":              latest_close,
-        "previous_close":            previous_close,
-        "experiment_day":            experiment_day,
-        "timestamp":                 datetime.now().isoformat()
-    })
+    # Build doc matching model_recommendations schema
+    rec_doc = {
+        "stock_ticker": stock,
+        "sentiment_summary": summary,
+        "latest_close": latest,
+        "previous_close": prev,
+        "is_correct": corr,
+        "aggregator_recommendation": agg_rec,
+        "gpt_recommendation": gpt_rec,
+        "timestamp": datetime.now().isoformat(),
+        "experiment_day": experiment_day,
+        "recommendation_detail": detail
+    }
+    rec_ref = db.collection("model_recommendations").add(rec_doc)
     rec_id = rec_ref[1].id
+    print(f"✅ Stored rec {rec_id} for {stock}")
 
-    # Economic data
-    eco_ref = db.collection("economic_data").add({
-        "stock_ticker":     stock_ticker,
-        "experiment_day":   experiment_day,
-        "latest_close":     latest_close,
-        "previous_close":   previous_close,
-        "price_change":     price_change,
-        "sentiment_summary": sentiment_summary,
+    econ_doc = {
+        "stock_ticker": stock,
+        "experiment_day": experiment_day,
+        "latest_close": latest,
+        "previous_close": prev,
+        "price_change": (latest - prev) / prev * 100 if prev else None,
+        "sentiment_summary": summary,
         "recommendation_id": rec_id,
-        "timestamp":         datetime.now().isoformat()
-    })
-    eco_id = eco_ref[1].id
-
-    print(f"✅ Stored rec {rec_id} & econ {eco_id} for {stock_ticker}")
+        "timestamp": datetime.now().isoformat()
+    }
+    db.collection("economic_data").add(econ_doc)
+    print(f"✅ Stored econ for {stock}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Daily Pipeline
+# Daily pipeline
 # ─────────────────────────────────────────────────────────────────────────────
-def run_daily_pipeline(stock_tickers, articles_per_stock=20):
-    for stock in stock_tickers:
+def run_daily_pipeline(stocks, articles_per_stock=20):
+    today = datetime.utcnow().date()
+    for stock in stocks:
         print(f"\n--- Processing {stock} ---")
-
-        # 1) Fetch news
         process_articles([stock], articles_per_stock)
-
-        # 2) Link news → econ data
-        snaps = db.collection("news").where("keywords", "array_contains", stock).stream()
-        for doc in snaps:
-            if not doc.to_dict().get("economic_data_id"):
-                link_news_to_economic_data(doc.id, stock)
-
-        # 3) Sentiment analysis + migrate leftovers
+        # link
+        for d in db.collection("news").where("keywords","array_contains",stock).stream():
+            if not d.to_dict().get("economic_data_id"):
+                link_news_to_economic_data(d.id, stock)
+        # sentiment
         analyze_sentiment_and_store()
         migrate_sentiment()
-
-        # 4) Gather processed articles
-        snaps2 = db.collection("news").where("economic_data_id", "==", stock).stream()
-        news_docs = [d.to_dict() for d in snaps2 if "sentiment_label" in d.to_dict()]
-        if not news_docs:
-            print(f"⚠️ No processed articles for {stock}. Skipping.")
+        # gather today's articles
+        docs = []
+        for snap in db.collection("news").where("economic_data_id","==",stock).stream():
+            data = snap.to_dict()
+            ts = data.get("timestamp")
+            if not ts or "sentiment_score" not in data:
+                continue
+            try:
+                dt = datetime.fromisoformat(ts).date()
+            except:
+                continue
+            if dt == today:
+                docs.append(data)
+        if not docs:
+            print(f"⚠️ No processed articles for {stock} today. Skipping.")
             continue
-
-        # 5) Generate recommendations (now returns reasoning)
-        agg, gpt, reasoning, summary = generate_rag_response(
-            f"What’s the outlook for {stock}?", news_docs
-        )
-
-        # 6) Evaluate
-        correct, latest, prev = evaluate_recommendation(stock, gpt)
-
-        # 7) Store
-        store_recommendation(stock, agg, gpt, summary, correct, latest, prev, full_text=reasoning)
-
+        # print sentiment
+        print(f"Today's sentiment scores for {stock}:")
+        for d in docs:
+            print(f"  • {d.get('title','[no title]')} → {d['sentiment_score']:.3f} ({d['sentiment_label']})")
+        # generate recs
+        agg_rec, gpt_rec, detail, summary = generate_rag_response(f"Outlook for {stock}?", docs)
+        # fetch prices
+        try:
+            latest, prev = fetch_closing_prices(stock)
+        except PriceFetchError as e:
+            print(f"❌ Could not fetch prices for {stock}: {e}")
+            continue
+        # evaluate
+        corr = evaluate_model(stock, gpt_rec, "GPT", latest, prev)
+        # store
+        store_recommendation(stock, agg_rec, gpt_rec, summary, corr, latest, prev, detail)
     print("\n✅ Daily pipeline complete.")
 
 if __name__ == "__main__":
-    run_daily_pipeline(["TSLA", "AAPL", "MSFT", "NVDA", "NVO"])
+    run_daily_pipeline(["TSLA","AAPL","MSFT","NVDA","NVO"])
