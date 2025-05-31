@@ -21,7 +21,7 @@ firebase-admin==6.3.0         # Firestore SDK (pin ≥6.2 for py-3.12 compat)
 ###############################################################################
 #  NLP & ML
 ###############################################################################
-torch==2.0.1                  # backend for transformers
+torch==2.7.0                  # backend for transformers
 transformers==4.33.3          # Hugging Face models
 finbert-embedding==0.1.5      # FinBERT weights/tokeniser
 scikit-learn==1.3.1           # ML utils
