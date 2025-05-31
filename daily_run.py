@@ -4,7 +4,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import firestore, credentials
-
+from datetime import datetime, timezone
+# ─────────────────────────────────────────────────────────────────────────────
 # External data sources
 import yfinance as yf
 from tiingo import TiingoClient
@@ -19,12 +20,15 @@ import tensorflow as tf
 import torch
 import time
 from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
+import os, warnings, logging
+import tensorflow as tf
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configurations
 # ─────────────────────────────────────────────────────────────────────────────
 VERBOSE = True
-EXPERIMENT_START_DATE = datetime(2025, 1, 22)
+EXPERIMENT_START_DATE = datetime(2025, 1, 22, tzinfo=timezone.utc)  # ← add tzinfo
 RETRY_SLEEP_SECONDS = 60
 TIINGO_BACKFILL_DAYS = 7
 
@@ -52,6 +56,7 @@ tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning)
 torch._C._jit_set_profiling_executor(False)
 torch._C._jit_set_profiling_mode(False)
+tf.get_logger().setLevel(logging.ERROR)       # hide Python-side warnings
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Initialize Firebase
@@ -135,96 +140,207 @@ def link_news_to_economic_data(news_id, stock):
 # Evaluate recommendation correctness
 # ─────────────────────────────────────────────────────────────────────────────
 def evaluate_model(stock, rec, model_name, latest, prev):
-    moved = latest > prev
-    correct = (rec.lower() in ["buy","hold"] and moved) or (rec.lower()=="sell" and not moved)
-    arrow = "↑" if moved else "↓"
-    pct = (latest - prev) / prev * 100 if prev else 0
-    print(f"{stock} [{model_name}]: {prev:.2f}→{latest:.2f} ({arrow}{pct:.2f}%) rec={rec} → {correct}")
+    moved   = latest > prev
+    # only buy / sell are valid now
+    correct = (rec.lower() == "buy"  and moved) or \
+              (rec.lower() == "sell" and not moved)
+    arrow   = "↑" if moved else "↓"
+    pct     = (latest - prev) / prev * 100 if prev else 0
+    print(f"{stock} [{model_name}]: {prev:.2f}→{latest:.2f} "
+          f"({arrow}{pct:.2f}%) rec={rec} → {correct}")
     return correct
 
+from datetime import datetime, timezone   # make sure this is at the top …
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Store recommendation + economic data
+# Store recommendation + economic data (UTC-aware)
 # ─────────────────────────────────────────────────────────────────────────────
-def store_recommendation(stock, agg_rec, gpt_rec, summary, corr, latest, prev, detail):
-    experiment_day = min((datetime.now() - EXPERIMENT_START_DATE).days, 90)
-    # Build doc matching model_recommendations schema
+def store_recommendation(
+    stock: str,
+    agg_rec: str,
+    gpt_rec: str,
+    summary: dict,
+    corr: bool,
+    latest: float,
+    prev: float,
+    detail: str
+) -> None:
+    # 1️⃣  figure out “experiment day” in a tz-safe way
+    now_utc = datetime.now(timezone.utc)
+    start   = EXPERIMENT_START_DATE
+    if start.tzinfo is None:               # legacy naïve constant
+        start = start.replace(tzinfo=timezone.utc)
+    experiment_day = (now_utc - start).days
+
+    # 2️⃣  shared timestamp string
+    ts_str = now_utc.isoformat()
+
+    # 3️⃣  build and store recommendation doc
     rec_doc = {
-        "stock_ticker": stock,
-        "sentiment_summary": summary,
-        "latest_close": latest,
-        "previous_close": prev,
-        "is_correct": corr,
+        "stock_ticker":            stock,
+        "sentiment_summary":       summary,
+        "latest_close":            latest,
+        "previous_close":          prev,
+        "is_correct":              corr,
         "aggregator_recommendation": agg_rec,
-        "gpt_recommendation": gpt_rec,
-        "timestamp": datetime.now().isoformat(),
-        "experiment_day": experiment_day,
-        "recommendation_detail": detail
+        "gpt_recommendation":      gpt_rec,
+        "timestamp":               ts_str,
+        "experiment_day":          experiment_day,
+        "recommendation_detail":   detail
     }
     rec_ref = db.collection("model_recommendations").add(rec_doc)
-    rec_id = rec_ref[1].id
+    rec_id  = rec_ref[1].id
     print(f"✅ Stored rec {rec_id} for {stock}")
 
+    # 4️⃣  build and store economic-data doc
     econ_doc = {
-        "stock_ticker": stock,
+        "stock_ticker":   stock,
         "experiment_day": experiment_day,
-        "latest_close": latest,
+        "latest_close":   latest,
         "previous_close": prev,
-        "price_change": (latest - prev) / prev * 100 if prev else None,
+        "price_change":   (latest - prev) / prev * 100 if prev else None,
         "sentiment_summary": summary,
         "recommendation_id": rec_id,
-        "timestamp": datetime.now().isoformat()
+        "timestamp":      ts_str
     }
     db.collection("economic_data").add(econ_doc)
     print(f"✅ Stored econ for {stock}")
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Daily pipeline
+# Daily pipeline – FinBERT vs GPT-4o-mini vs actual price move
 # ─────────────────────────────────────────────────────────────────────────────
-def run_daily_pipeline(stocks, articles_per_stock=20):
-    today = datetime.utcnow().date()
+from datetime import datetime, timedelta, timezone
+from rich.console import Console
+from rich.table   import Table
+
+WINDOW_HOURS        = 24         # rolling horizon (7 days)
+MAX_DOCS_PER_STOCK  = 20           # cap after sorting by ingested_at
+REQUIRE_TODAY_NEWS  = True        # True → must be ingested today
+SHOW_ARTICLE_LINES  = False        # verbose per-headline print
+
+console = Console()
+
+def finbert_to_rec(total_signed: float) -> str:
+    """Aggregate FinBERT score → BUY / SELL."""
+    return "buy" if total_signed > 0 else "sell"
+
+
+def run_daily_pipeline(stocks, articles_per_stock: int = 20) -> None:
+    cutoff    = datetime.now(timezone.utc) - timedelta(hours=WINDOW_HOURS)
+    today_utc = cutoff.date()
+    summary_rows = []
+
     for stock in stocks:
-        print(f"\n--- Processing {stock} ---")
+        console.rule(f"[bold yellow]{stock} (last {WINDOW_HOURS} h)")
+
+        # 1) ingest up to `articles_per_stock` new headlines
         process_articles([stock], articles_per_stock)
-        # link
-        for d in db.collection("news").where("keywords","array_contains",stock).stream():
-            if not d.to_dict().get("economic_data_id"):
-                link_news_to_economic_data(d.id, stock)
-        # sentiment
+
+        # 2) ensure every news doc links to its econ record
+        for snap in db.collection("news") \
+                      .where("keywords", "array_contains", stock).stream():
+            if not snap.to_dict().get("economic_data_id"):
+                link_news_to_economic_data(snap.id, stock)
+
         analyze_sentiment_and_store()
         migrate_sentiment()
-        # gather today's articles
+
+        # 3) collect docs inside window – then cap to 20 freshest
         docs = []
-        for snap in db.collection("news").where("economic_data_id","==",stock).stream():
-            data = snap.to_dict()
-            ts = data.get("timestamp")
-            if not ts or "sentiment_score" not in data:
+        for snap in db.collection("news") \
+                      .where("economic_data_id", "==", stock).stream():
+            d = snap.to_dict()
+            if "sentiment_score" not in d:
                 continue
+
+            raw_ts = d.get("ingested_at") or d.get("timestamp", "")
             try:
-                dt = datetime.fromisoformat(ts).date()
-            except:
+                ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
+            except Exception:
                 continue
-            if dt == today:
-                docs.append(data)
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+
+            fresh    = ts >= cutoff
+            is_today = ts.date() == today_utc
+            if fresh and (not REQUIRE_TODAY_NEWS or is_today):
+                d["__ts"] = ts            # stash for sorting
+                docs.append(d)
+
+        # keep only N freshest by ingested_at
+        docs.sort(key=lambda x: x["__ts"], reverse=True)
+        docs = docs[:MAX_DOCS_PER_STOCK]
+
         if not docs:
-            print(f"⚠️ No processed articles for {stock} today. Skipping.")
+            console.print(
+                f"[italic]No qualifying headlines "
+                f"(≤{WINDOW_HOURS} h and REQUIRE_TODAY_NEWS={REQUIRE_TODAY_NEWS}).[/]")
             continue
-        # print sentiment
-        print(f"Today's sentiment scores for {stock}:")
+
+        # 4) (optional) per-headline sentiment
+        signed_scores = []
+        if SHOW_ARTICLE_LINES:
+            console.print("• Article sentiment:")
         for d in docs:
-            print(f"  • {d.get('title','[no title]')} → {d['sentiment_score']:.3f} ({d['sentiment_label']})")
-        # generate recs
-        agg_rec, gpt_rec, detail, summary = generate_rag_response(f"Outlook for {stock}?", docs)
-        # fetch prices
+            lbl  = d["sentiment_label"].lower()
+            sc   = d["sentiment_score"]
+            val  = +sc if lbl == "positive" else -sc if lbl == "negative" else 0.0
+            signed_scores.append(val)
+            if SHOW_ARTICLE_LINES:
+                console.print(f"  {val:+.3f} ({lbl})  {d['title'][:80]}")
+
+        # 5) model outputs
+        finbert_total = sum(signed_scores)
+        finbert_rec   = finbert_to_rec(finbert_total)
+        agg_rec, gpt_rec, detail, summary = generate_rag_response(
+            f"Outlook for {stock}?", docs
+        )
+
+        # 6) prices
         try:
             latest, prev = fetch_closing_prices(stock)
-        except PriceFetchError as e:
-            print(f"❌ Could not fetch prices for {stock}: {e}")
+        except PriceFetchError as err:
+            console.print(f"[red]{err}[/]")
             continue
-        # evaluate
-        corr = evaluate_model(stock, gpt_rec, "GPT", latest, prev)
-        # store
-        store_recommendation(stock, agg_rec, gpt_rec, summary, corr, latest, prev, detail)
-    print("\n✅ Daily pipeline complete.")
+        move_pct = (latest - prev) / prev * 100
+        arrow    = "↑" if latest > prev else "↓"
+
+        # 7) accuracy flags
+        fin_ok = evaluate_model(stock, finbert_rec, "FinBERT",    latest, prev)
+        gpt_ok = evaluate_model(stock, gpt_rec,    "GPT-4o-mini", latest, prev)
+
+        # 8) add to summary table
+        summary_rows.append((
+            stock,
+            f"{finbert_total:+.3f}",
+            finbert_rec.upper(),
+            gpt_rec.upper(),
+            f"{prev:.2f}",
+            f"{latest:.2f}",
+            f"{move_pct:+.2f} %",
+            "✅" if fin_ok else "❌",
+            "✅" if gpt_ok else "❌"
+        ))
+
+        # 9) write to Firestore
+        store_recommendation(
+            stock, agg_rec, gpt_rec, summary, gpt_ok,
+            latest, prev, detail
+        )
+
+    # ── pretty Rich table ────────────────────────────────────────────
+    if summary_rows:
+        table = Table(title="Daily Model Summary", show_lines=True)
+        for col in ["Ticker", "FinBERT Σ", "FinBERT Rec", "GPT Rec",
+                    "Prev Close", "Latest Close", "Move %", "FinBERT✔", "GPT✔"]:
+            table.add_column(col, justify="right")
+        for row in summary_rows:
+            table.add_row(*row)
+        console.print(table)
+
+    console.print("[bold green]✅ Daily pipeline complete.[/]")
+
 
 if __name__ == "__main__":
-    run_daily_pipeline(["TSLA","AAPL","MSFT","NVDA","NVO"])
+    run_daily_pipeline(["TSLA", "AAPL", "MSFT", "NVDA", "NVO"])
