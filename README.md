@@ -1,4 +1,4 @@
-# Master Thesis
+# Stock Sentiment & Recommendation System
 
 This repository contains the full codebase and resources for a **Master’s Thesis** project focused on real-time sentiment analysis and LLM-driven stock recommendations. The pipeline integrates multiple APIs, a Firebase database, and a modular agent architecture to generate daily **Buy / Hold / Sell** signals for selected stocks.
 
